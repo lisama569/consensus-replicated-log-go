@@ -94,11 +94,15 @@ func (c *cluster) logStates(prefix string) {
 	}
 }
 
-// leader 返回当前唯一领导者；存在多个或零个时失败。
-func (c *cluster) leader() *Node {
+
+// leader 返回全集群唯一领导者；存在多个或零个时失败。
+func (c *cluster) leader() *Node { return c.leaderIn(c.ids) }
+
+// leaderIn 在给定节点集合内断言唯一领导者（用于分区场景）。
+func (c *cluster) leaderIn(ids []int) *Node {
 	c.t.Helper()
 	var leaders []*Node
-	for _, id := range c.ids {
+	for _, id := range ids {
 		if c.crashed[id] {
 			continue
 		}
@@ -108,18 +112,21 @@ func (c *cluster) leader() *Node {
 	}
 	if len(leaders) != 1 {
 		c.logStates("LEADER-CHECK")
-		c.t.Fatalf("want exactly 1 leader, got %d", len(leaders))
+		c.t.Fatalf("want exactly 1 leader in %v, got %d", ids, len(leaders))
 	}
 	return leaders[0]
 }
 
-// waitLeader 在 maxTicks 内等待选出一个领导者。
-func (c *cluster) waitLeader(maxTicks int) *Node {
+// waitLeader 在 maxTicks 内等待全集群选出一个领导者。
+func (c *cluster) waitLeader(maxTicks int) *Node { return c.waitLeaderIn(maxTicks, c.ids) }
+
+// waitLeaderIn 在 maxTicks 内等待给定集合内选出一个领导者。
+func (c *cluster) waitLeaderIn(maxTicks int, ids []int) *Node {
 	c.t.Helper()
 	for i := 0; i < maxTicks; i++ {
 		c.tick(1)
 		count := 0
-		for _, id := range c.ids {
+		for _, id := range ids {
 			if c.crashed[id] {
 				continue
 			}
@@ -128,11 +135,11 @@ func (c *cluster) waitLeader(maxTicks int) *Node {
 			}
 		}
 		if count == 1 {
-			return c.leader()
+			return c.leaderIn(ids)
 		}
 	}
 	c.logStates("WAIT-LEADER")
-	c.t.Fatalf("no stable leader after %d ticks", maxTicks)
+	c.t.Fatalf("no stable leader in %v after %d ticks", ids, maxTicks)
 	return nil
 }
 
