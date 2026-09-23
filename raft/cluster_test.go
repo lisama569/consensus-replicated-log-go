@@ -42,7 +42,6 @@ func newCluster(t *testing.T, ids ...int) *cluster {
 	return c
 }
 
-
 func (c *cluster) spawn(id int) {
 	cfg := Config{
 		ID:               id,
@@ -93,7 +92,6 @@ func (c *cluster) logStates(prefix string) {
 		c.t.Logf("[tick=%d] %s %s", c.ticks, prefix, c.nodes[id].Describe())
 	}
 }
-
 
 // leader 返回全集群唯一领导者；存在多个或零个时失败。
 func (c *cluster) leader() *Node { return c.leaderIn(c.ids) }
