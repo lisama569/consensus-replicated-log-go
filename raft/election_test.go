@@ -106,35 +106,22 @@ func TestStaleTermRejected(t *testing.T) {
 
 // 同一任期重复投票必须被拒绝（AlreadyVoted），不同任期可以投票。
 func TestAlreadyVotedRejected(t *testing.T) {
-	s1, s2 := NewMemoryStorage(), NewMemoryStorage()
+	st := NewMemoryStorage()
 	net := NewNetwork()
-	mk := func(id int, st *MemoryStorage) *Node {
-		return NewNode(Config{ID: id, Peers: []int{0, 1, 2}, ElectionTimeout: 1000, HeartbeatTimeout: 3, Storage: st, Transport: net})
-	}
-	voter := mk(2, s2)
-	// 手动让 voter 进入任期 5。
+	voter := NewNode(Config{ID: 2, Peers: []int{0, 1, 2}, ElectionTimeout: 1000, HeartbeatTimeout: 3, Storage: st, Transport: net})
+	// 手动让 voter 进入任期 5 并投票给候选人 0。
 	voter.Step(Message{Type: MsgRequestVote, From: 0, To: 2, Term: 5, LastLogIndex: 0, LastLogTerm: 0})
-	_, term, _ := voter.State()
-	if term != 5 {
-		t.Fatalf("voter term=%d, want 5", term)
+	hs, _ := st.LoadHardState()
+	if hs.Term != 5 || hs.VotedFor != 0 {
+		t.Fatalf("term=%d votedFor=%d, want 5/0", hs.Term, hs.VotedFor)
 	}
-	// 同任期另一个候选人要票：应拒绝 ALREADY_VOTED。
-	var gotReject RejectReason
-	net2 := NewNetwork()
-	_ = net2
-	// 直接观察 voter 的持久化投票记录。
-	hs, _ := s2.LoadHardState()
-	if hs.VotedFor != 0 {
-		t.Fatalf("votedFor=%d, want 0", hs.VotedFor)
-	}
+	// 同任期另一个候选人要票：必须拒绝（ALREADY_VOTED），投票记录不得改变。
 	voter.Step(Message{Type: MsgRequestVote, From: 1, To: 2, Term: 5, LastLogIndex: 0, LastLogTerm: 0})
-	hs, _ = s2.LoadHardState()
+	hs, _ = st.LoadHardState()
 	if hs.VotedFor != 0 {
 		t.Fatalf("double vote detected: votedFor=%d (reject reason=%s)", hs.VotedFor, ReasonAlreadyVoted)
 	}
-	gotReject = ReasonAlreadyVoted
-	t.Logf("double-vote rejected with reason=%s; votedFor stays %d", gotReject, hs.VotedFor)
-	_ = s1
+	t.Logf("double-vote rejected with reason=%s; votedFor stays %d; %s", ReasonAlreadyVoted, hs.VotedFor, voter.Describe())
 }
 
 func leaderless(c *cluster, l *Node) int {
