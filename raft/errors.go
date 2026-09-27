@@ -13,6 +13,9 @@ const (
 	RejectNotLeader      RejectReason = "not_leader"         // 本节点不是领导者（客户端请求）
 	RejectLeaderDeposed  RejectReason = "leader_deposed"     // 领导者在提交前发现更高任期，已被废黜
 	RejectSteppedDown    RejectReason = "stepped_down"       // 节点已关闭/下台，无法处理
+	RejectResync         RejectReason = "resync"             // 分块传输：无匹配的临时快照/偏移不符，要求从 0 重发
+	RejectTransferFailed RejectReason = "transfer_failed"    // 分块传输：校验和不符/落盘失败，临时快照已丢弃
+	RejectCancelled      RejectReason = "cancelled"          // 追赶已被用户取消
 )
 
 // 可用于 errors.Is 的哨兵错误。

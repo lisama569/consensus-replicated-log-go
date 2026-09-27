@@ -46,6 +46,10 @@ type FileStore struct {
 	memSnap  *persistedSnapshot
 	hasState bool
 	hasSnap  bool
+
+	// 内存模式下的临时分块快照。
+	memStaging     *persistedStaging
+	memStagingData []byte
 }
 
 // OpenStore 打开（不存在则初始化）数据目录。

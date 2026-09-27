@@ -32,6 +32,16 @@ type policyKey struct {
 	kind     RPCKind
 }
 
+// SnapshotFaultHook 是测试用的快照消息钩子（仅对分块 InstallSnapshot 生效）。
+//   - Drop 返回 true 时该消息（请求）被直接丢弃，模拟丢包/超时；
+//   - Mutate 可在投递前原地修改请求（例如翻转字节模拟链路损坏）。
+//
+// 钩子用于测试与本地复现；生产环境不要设置。
+type SnapshotFaultHook struct {
+	Drop   func(from, to NodeID, req *InstallSnapshotRequest) bool
+	Mutate func(from, to NodeID, req *InstallSnapshotRequest)
+}
+
 // MemoryTransport 是进程内模拟网络：同步调用 + 可注入故障。
 type MemoryTransport struct {
 	mu       sync.RWMutex
@@ -41,6 +51,9 @@ type MemoryTransport struct {
 	delayMax time.Duration
 	rngMu    sync.Mutex
 	rng      *rand.Rand
+
+	hookMu sync.Mutex
+	hook   *SnapshotFaultHook
 }
 
 func NewMemoryTransport() *MemoryTransport {
@@ -149,6 +162,19 @@ func (t *MemoryTransport) clearPoliciesBetween(from, to NodeID) {
 	}
 }
 
+// SetSnapshotHook 安装/清除测试用快照故障钩子。
+func (t *MemoryTransport) SetSnapshotHook(h *SnapshotFaultHook) {
+	t.hookMu.Lock()
+	t.hook = h
+	t.hookMu.Unlock()
+}
+
+func (t *MemoryTransport) snapshotHook() *SnapshotFaultHook {
+	t.hookMu.Lock()
+	defer t.hookMu.Unlock()
+	return t.hook
+}
+
 func (t *MemoryTransport) randf() float64 {
 	t.rngMu.Lock()
 	defer t.rngMu.Unlock()
@@ -202,6 +228,17 @@ func (t *MemoryTransport) SendRequestVote(ctx context.Context, to NodeID, req *R
 }
 
 func (t *MemoryTransport) SendInstallSnapshot(ctx context.Context, to NodeID, req *InstallSnapshotRequest) *InstallSnapshotResponse {
+	// 测试钩子：可丢块或损坏块（仅对分块消息生效，避免影响旧版整包路径）。
+	if req.Chunked {
+		if h := t.snapshotHook(); h != nil {
+			if h.Drop != nil && h.Drop(req.LeaderID, to, req) {
+				return nil
+			}
+			if h.Mutate != nil {
+				h.Mutate(req.LeaderID, to, req)
+			}
+		}
+	}
 	r := t.deliver(req.LeaderID, to, RPCInstallSnapshot, req)
 	if r == nil {
 		return nil

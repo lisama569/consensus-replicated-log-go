@@ -70,4 +70,6 @@ type Status struct {
 	AppliedIndex  Index
 	SnapshotIndex Index
 	Peers         []NodeID
+	// CatchUp 本节点作为接收方的快照追赶进度。
+	CatchUp CatchUpProgress
 }

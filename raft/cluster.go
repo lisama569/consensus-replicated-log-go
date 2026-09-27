@@ -3,6 +3,7 @@ package raft
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 )
 
@@ -14,6 +15,7 @@ type Cluster struct {
 	dir    string
 	seed   int64
 	cfgs   map[NodeID]Config
+	mu     sync.Mutex // 保护 nodes：测试的故障钩子 goroutine 可能与主 goroutine 并发 Crash/Restart
 	nodes  map[NodeID]*Node
 	logAll atomic.Bool
 }
@@ -70,7 +72,9 @@ func (c *Cluster) spawn(id NodeID) error {
 		n.SetLogger(defaultLogger(id))
 	}
 	n.Start()
+	c.mu.Lock()
 	c.nodes[id] = n
+	c.mu.Unlock()
 	return nil
 }
 
@@ -81,9 +85,38 @@ func (c *Cluster) SetSnapshotThreshold(id NodeID, n uint64) {
 	c.cfgs[id] = cfg
 }
 
-func (c *Cluster) Nodes() map[NodeID]*Node { return c.nodes }
+// SetSnapshotChunkSize 配置分块快照的块大小（对尚未创建的节点生效，需重启节点加载）。
+func (c *Cluster) SetSnapshotChunkSize(id NodeID, bytes int) {
+	cfg := c.cfgs[id]
+	cfg.SnapshotChunkSize = bytes
+	c.cfgs[id] = cfg
+}
 
-func (c *Cluster) Node(id NodeID) *Node { return c.nodes[id] }
+// SetSnapshotChunkSizeAll 对集群全部节点设置块大小。
+func (c *Cluster) SetSnapshotChunkSizeAll(bytes int) {
+	for _, id := range c.IDs() {
+		c.SetSnapshotChunkSize(id, bytes)
+	}
+}
+
+// SetSnapshotHook 转发到传输层的测试故障钩子。
+func (c *Cluster) SetSnapshotHook(h *SnapshotFaultHook) { c.Tr.SetSnapshotHook(h) }
+
+func (c *Cluster) Nodes() map[NodeID]*Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[NodeID]*Node, len(c.nodes))
+	for k, v := range c.nodes {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *Cluster) Node(id NodeID) *Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nodes[id]
+}
 
 func (c *Cluster) IDs() []NodeID {
 	out := make([]NodeID, 0, len(c.cfgs))
@@ -95,7 +128,13 @@ func (c *Cluster) IDs() []NodeID {
 
 // Leader 轮询各节点状态返回当前领导者（无则返回空串）。
 func (c *Cluster) Leader() NodeID {
+	c.mu.Lock()
+	snap := make([]*Node, 0, len(c.nodes))
 	for _, n := range c.nodes {
+		snap = append(snap, n)
+	}
+	c.mu.Unlock()
+	for _, n := range snap {
 		if s := n.Status(); s.Role == RoleLeader {
 			return s.ID
 		}
@@ -105,20 +144,26 @@ func (c *Cluster) Leader() NodeID {
 
 // Crash 停止节点并从内存移除（磁盘保留），模拟进程崩溃。
 func (c *Cluster) Crash(id NodeID) error {
+	c.mu.Lock()
 	n, ok := c.nodes[id]
+	if ok {
+		delete(c.nodes, id)
+	}
+	c.mu.Unlock()
 	if !ok {
 		return nil
 	}
-	if err := n.Stop(); err != nil {
-		return err
-	}
-	delete(c.nodes, id)
-	return nil
+	// Stop 在锁外执行（可能等待在途 RPC），避免与其它节点操作互锁；
+	// 删除映射已在锁内完成，重复 Crash 只会看到 !ok。
+	return n.Stop()
 }
 
 // Restart 用同一数据目录重建节点，模拟崩溃后恢复。
 func (c *Cluster) Restart(id NodeID) error {
-	if _, ok := c.nodes[id]; ok {
+	c.mu.Lock()
+	_, ok := c.nodes[id]
+	c.mu.Unlock()
+	if ok {
 		return nil
 	}
 	return c.spawn(id)
@@ -137,14 +182,14 @@ func (c *Cluster) Flaky(from, to NodeID, kind RPCKind, p FaultPolicy) {
 // EnableLogs 对当前及未来重启的节点打印调试日志。
 func (c *Cluster) EnableLogs() {
 	c.logAll.Store(true)
-	for _, n := range c.nodes {
+	for _, n := range c.Nodes() {
 		n.SetLogger(defaultLogger(n.cfg.ID))
 	}
 }
 
 func (c *Cluster) Stop() error {
 	var first error
-	for id := range c.nodes {
+	for _, id := range c.IDs() {
 		if err := c.Crash(id); err != nil && first == nil {
 			first = err
 		}

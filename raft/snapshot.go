@@ -71,33 +71,46 @@ func (n *Node) snapshotMetaAt(index Index) (SnapshotMeta, bool) {
 	return SnapshotMeta{LastIncludedIndex: index, LastIncludedTerm: e.Term}, true
 }
 
-// loadSnapshotBytes 读取本地快照字节，供领导者向落后节点发送。
-func (n *Node) loadSnapshotBytes() ([]byte, bool) {
+// loadSnapshotForTransfer 读取本地快照字节并计算校验和，供分块发送使用。
+func (n *Node) loadSnapshotForTransfer() ([]byte, SnapshotMeta, []byte, bool) {
 	meta, data, err := n.store.LoadSnapshot()
 	if err != nil || meta.LastIncludedIndex == 0 {
-		return nil, false
+		return nil, SnapshotMeta{}, nil, false
 	}
-	return data, true
+	sum := sha256Sum(data)
+	return data, meta, sum, true
 }
 
-// sendSnapshot 领导者向 peer 发送 InstallSnapshot。
+// sendSnapshot 领导者向 peer 发送快照：优先使用分块可续传传输；
+// 读取本地快照失败时回退为空操作（下一轮心跳会再次尝试）。
 func (n *Node) sendSnapshot(peer NodeID) {
-	data, ok := n.loadSnapshotBytes()
-	if !ok {
-		return
-	}
-	req := &InstallSnapshotRequest{
-		Term:              n.term,
-		LeaderID:          n.cfg.ID,
-		LastIncludedIndex: n.snapMeta.LastIncludedIndex,
-		LastIncludedTerm:  n.snapMeta.LastIncludedTerm,
-		Data:              data,
-	}
+	n.startSnapshotTransfer(peer)
+}
+
+// snapshotIdentity 标识一份快照的内容身份。
+type snapshotIdentity struct {
+	lastIncluded Index
+	term         Term
+	length       uint64
+	checksum     string
+}
+
+// sendSnapshotChunk 在独立 goroutine 中发送一个分块快照请求，响应投递回事件循环。
+func (n *Node) sendSnapshotChunk(peer NodeID, req *InstallSnapshotRequest) {
+	// 防御性拷贝：内存传输会把请求指针直接交给对端处理器，
+	// 不能让对端（或测试钩子）通过共享底层数组改到本节点的快照内存。
+	out := *req
+	out.Data = append([]byte(nil), req.Data...)
+	out.Checksum = append([]byte(nil), req.Checksum...)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
-		rpcResp := n.tr.SendInstallSnapshot(context.Background(), peer, req)
+		rpcResp := n.tr.SendInstallSnapshot(context.Background(), peer, &out)
 		if rpcResp == nil {
+			select {
+			case n.events <- internalEvent{kind: eventRPC, rpc: chunkTimeout{peer: peer}}:
+			case <-n.stopCh:
+			}
 			return
 		}
 		result := &installResult{
@@ -105,15 +118,24 @@ func (n *Node) sendSnapshot(peer NodeID) {
 			success:      rpcResp.Success,
 			reason:       rpcResp.Reason,
 			lastIncluded: req.LastIncludedIndex,
+			chunked:      true,
+			transferID:   rpcResp.TransferID,
+			ackOffset:    rpcResp.AckOffset,
+			complete:     rpcResp.Complete,
 		}
 		select {
-		case n.events <- internalEvent{kind: eventRPC, rpc: snapshotResponse{peer: peer, resp: result}}:
+		case n.events <- internalEvent{kind: eventRPC,
+			rpc: snapshotResponse{peer: peer, resp: result}}:
 		case <-n.stopCh:
 		}
 	}()
 }
 
-// handleInstallSnapshot 在事件循环内处理快照安装（论文 §5.7）。
+// chunkTimeout 表示某个分块的请求或响应丢失（网络返回 nil）。
+type chunkTimeout struct{ peer NodeID }
+
+// handleInstallSnapshot 在事件循环内处理旧版（一次性整体）快照安装（论文 §5.7）。
+// 保留该路径用于与旧版本节点的互操作；大快照默认走分块续传路径。
 func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapshotResponse {
 	resp := &InstallSnapshotResponse{Term: n.term, Peer: n.cfg.ID}
 
@@ -139,11 +161,28 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 		return resp
 	}
 
-	// 1. 先落盘快照。
 	meta := SnapshotMeta{LastIncludedIndex: req.LastIncludedIndex, LastIncludedTerm: req.LastIncludedTerm}
-	if err := n.store.SaveSnapshot(meta, req.Data); err != nil {
-		n.logf("[%s] save received snapshot error: %v", n.cfg.ID, err)
+	if err := n.commitSnapshotInstall(meta, req.Data); err != nil {
+		n.logf("[%s] install snapshot error: %v", n.cfg.ID, err)
 		return resp
+	}
+	n.debugf("installed snapshot through index=%d term=%d (commit=%d applied=%d suffix=%d)",
+		meta.LastIncludedIndex, meta.LastIncludedTerm, n.commitIndex, n.lastApplied, len(n.log)-1)
+	resp.Success = true
+	return resp
+}
+
+// commitSnapshotInstall 把一份完整快照提升为节点当前状态：
+//  1. 先原子落盘正式快照（崩溃恢复不丢）；
+//  2. 重置日志为「占位项 + 快照点之后仍连续匹配的后缀」并重写日志文件；
+//  3. 恢复状态机；
+//  4. 提交/应用位置至少追到快照点，再继续应用保留后缀中的已提交条目。
+//
+// 压缩与安装共用该函数，保证两种路径的崩溃安全语义完全一致。
+func (n *Node) commitSnapshotInstall(meta SnapshotMeta, data []byte) error {
+	// 1. 先落盘快照。
+	if err := n.store.SaveSnapshot(meta, data); err != nil {
+		return err
 	}
 
 	// 2. 重置内存日志：占位项 + 快照点之后仍连续匹配的后缀（论文规则）。
@@ -164,23 +203,18 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 	}
 
 	// 3. 恢复状态机到快照内容。
-	if err := n.sm.Restore(req.Data); err != nil {
-		n.logf("[%s] restore snapshot error: %v", n.cfg.ID, err)
-		return resp
+	if err := n.sm.Restore(data); err != nil {
+		return err
 	}
 
 	// 4. 提交位置/应用位置至少追到快照点。
-	if req.LastIncludedIndex > n.commitIndex {
-		n.commitIndex = req.LastIncludedIndex
+	if meta.LastIncludedIndex > n.commitIndex {
+		n.commitIndex = meta.LastIncludedIndex
 	}
-	if req.LastIncludedIndex > n.lastApplied {
-		n.lastApplied = req.LastIncludedIndex
+	if meta.LastIncludedIndex > n.lastApplied {
+		n.lastApplied = meta.LastIncludedIndex
 	}
 	// 若保留了快照点之后的已提交条目，继续应用。
 	n.applyCommitted()
-
-	n.debugf("installed snapshot through index=%d term=%d (commit=%d applied=%d suffix=%d)",
-		meta.LastIncludedIndex, meta.LastIncludedTerm, n.commitIndex, n.lastApplied, len(n.log)-1)
-	resp.Success = true
-	return resp
+	return nil
 }

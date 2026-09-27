@@ -26,6 +26,18 @@ func main() {
 	c.EnableLogs()
 	defer func() { _ = c.Stop() }()
 
+	// 使用较小的快照分块，便于在 demo 中观察到多块续传与字节级进度。
+	// SetSnapshotChunkSize 对尚未创建的节点生效，因此先崩溃再重启全部节点加载配置。
+	for _, id := range c.IDs() {
+		c.SetSnapshotChunkSize(id, 256)
+	}
+	for _, id := range c.IDs() {
+		must(c.Crash(id))
+	}
+	for _, id := range c.IDs() {
+		must(c.Restart(id))
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -115,6 +127,31 @@ func main() {
 	}
 	fmt.Printf("   离线期间集群又提交 65 条并多次压缩，节点 %s 的历史日志已过时\n", victim)
 	must(c.Restart(victim))
+	// 演示用户侧可查询的追赶进度：syncing(字节进度) -> caught_up(就绪)。
+	go func() {
+		n := c.Node(victim)
+		if n == nil {
+			return
+		}
+		var lastState raft.CatchUpState
+		var lastRecv uint64
+		for i := 0; i < 5000; i++ {
+			time.Sleep(2 * time.Millisecond)
+			if cur := c.Node(victim); cur != nil {
+				n = cur
+			}
+			p := n.CatchUpProgress()
+			if p.State != lastState || p.Received != lastRecv {
+				fmt.Printf("   [catch-up] %s: state=%s bytes=%d/%d ready=%v\n",
+					victim, p.State, p.Received, p.Total, p.Ready())
+				lastState = p.State
+				lastRecv = p.Received
+			}
+			if p.Ready() {
+				return
+			}
+		}
+	}()
 	wait(func() bool {
 		n := c.Node(victim)
 		if n == nil {
@@ -124,7 +161,7 @@ func main() {
 		return ok && v == "b79" && n.Status().SnapshotIndex > 0
 	})
 	s := c.Node(victim).Status()
-	fmt.Printf("   节点 %s 通过快照追至 snap=%d commit=%d\n", victim, s.SnapshotIndex, s.CommitIndex)
+	fmt.Printf("   节点 %s 通过可恢复分块快照追至 snap=%d commit=%d\n", victim, s.SnapshotIndex, s.CommitIndex)
 	printStatus(c, "最终集群状态")
 
 	step("完成：分区、崩溃重启、消息重试、快照追赶下结果唯一且可复现")

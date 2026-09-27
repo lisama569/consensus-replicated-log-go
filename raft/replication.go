@@ -92,8 +92,10 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 	}
 	ni := n.nextIndex[peer]
 
-	// peer 落后到快照覆盖范围之前：改用 InstallSnapshot 追赶。
-	if ni <= n.snapMeta.LastIncludedIndex {
+	// peer 落后到快照覆盖范围之前：改用分块 InstallSnapshot 追赶。
+	// 判定必须以 matchIndex 为准：nextIndex=snapLast+1 时 AE 的 prevIndex
+	// 正好是 snapLast，而没有该快照的跟随者仍然匹配不上，会陷入拒绝风暴。
+	if n.matchIndex[peer] < n.snapMeta.LastIncludedIndex {
 		n.sendSnapshot(peer)
 		return
 	}
@@ -159,13 +161,17 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 	} else {
 		prev, ok := n.entryAt(req.PrevLogIndex)
 		if !ok {
-			// 缺少 prevLogIndex：告知领导者本节点最后一条之后的位置。
+			// 缺少 prevLogIndex：告知领导者本节点日志的真实起点。
+			// XIndex 必须是本节点仍可能保留的第一条索引：
+			// 有快照时为快照点之后（领导者据此直接走 InstallSnapshot），
+			// 绝不能回填到已被压缩的占位索引。
+			first := n.snapMeta.LastIncludedIndex + 1
 			resp.Success = false
 			resp.PeerLastIndex = n.lastLogIndex()
 			resp.XTerm = 0
-			resp.XIndex = n.lastLogIndex() + 1
-			n.debugf("append rejected: missing prevIndex=%d (local last=%d)",
-				req.PrevLogIndex, n.lastLogIndex())
+			resp.XIndex = first
+			n.debugf("append rejected: missing prevIndex=%d (local last=%d, first=%d)",
+				req.PrevLogIndex, n.lastLogIndex(), first)
 			return resp
 		}
 		if prev.Term != req.PrevLogTerm {
@@ -268,6 +274,8 @@ func (n *Node) handleAppendResponse(peer NodeID, resp *AppendEntriesResponse) {
 	n.tryServeReads()
 
 	// peer 可能还落后（本次只发了窗口或之前是冲突重试），继续推送。
+	// 已完成的快照会话记录保留在 snapXfers 中用于进度查询，
+	// 下一次需要快照追赶时 startSnapshotTransfer 会比较快照身份并替换。
 	if n.matchIndex[peer] < n.lastLogIndex() {
 		n.sendAppendEntries(peer)
 	}
@@ -291,9 +299,11 @@ func (n *Node) backoffPeer(peer NodeID, resp *AppendEntriesResponse) {
 	default:
 		n.nextIndex[peer] = 1
 	}
-	// 快照边界兜底。
-	if min := n.snapMeta.LastIncludedIndex + 1; n.nextIndex[peer] < min {
-		n.nextIndex[peer] = min
+	// 快照边界强制夹取：nextIndex 必须严格大于本节点快照点。
+	// 跟随者可能只持有未压缩的旧前缀，给出的 XIndex 落在快照点或更早；
+	// 这种 nextIndex 一律意味着“落后到快照覆盖范围”，必须走 InstallSnapshot。
+	if n.nextIndex[peer] <= n.snapMeta.LastIncludedIndex {
+		n.nextIndex[peer] = n.snapMeta.LastIncludedIndex + 1
 	}
 	n.sendAppendEntries(peer)
 }

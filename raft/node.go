@@ -47,6 +47,14 @@ type Node struct {
 	nextIndex  map[NodeID]Index
 	matchIndex map[NodeID]Index
 
+	// 领导者侧：每个 peer 的分块快照发送会话（仅事件循环访问）。
+	snapXfers map[NodeID]*snapshotTransfer
+	// 下一个分块传输标识。
+	nextTransferID uint64
+
+	// 跟随者侧：进行中的分块快照接收状态（仅事件循环访问；nil 表示没有）。
+	incoming *incomingSnapshot
+
 	// 候选人得票
 	grantedVotes map[NodeID]bool
 
@@ -90,6 +98,7 @@ func NewNode(cfg Config, tr Transport) (*Node, error) {
 		role:       RoleFollower,
 		nextIndex:  make(map[NodeID]Index),
 		matchIndex: make(map[NodeID]Index),
+		snapXfers:  make(map[NodeID]*snapshotTransfer),
 		proposals:  make(map[Index][]chan clientOutcome),
 		appliedSeq: make(map[string]appliedSeqEntry),
 		events:     make(chan internalEvent, 256),
@@ -152,6 +161,11 @@ func (n *Node) restore() error {
 			return fmt.Errorf("log suffix gap: want index %d, got %d", want, entries[0].Index)
 		}
 		n.log = append(n.log, entries...)
+	}
+
+	// 恢复上次未完成的分块快照接收状态（仅用于从断点续传，绝不直接安装）。
+	if err := n.restoreIncoming(); err != nil {
+		return fmt.Errorf("restore staging snapshot: %w", err)
 	}
 	return nil
 }
@@ -264,6 +278,26 @@ type clientCall struct {
 
 type statusCall struct {
 	res chan<- Status
+}
+
+// catchupCall 在事件循环内查询/控制本机快照追赶状态。
+type catchupCall struct {
+	op   catchupOp
+	res  chan CatchUpProgress
+	done chan error
+}
+
+type catchupOp int
+
+const (
+	catchupProgress catchupOp = iota
+	catchupCancel
+	catchupResume
+)
+
+// transfersCall 查询领导者侧各 peer 的快照传输进度。
+type transfersCall struct {
+	res chan map[NodeID]CatchUpProgress
 }
 
 type proposeReq struct {

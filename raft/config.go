@@ -23,6 +23,11 @@ type Config struct {
 	// SnapshotThreshold 快照之后增量日志达到该条数时触发一次压缩。
 	SnapshotThreshold uint64
 
+	// SnapshotChunkSize 分块快照每块的目标字节数；0 使用默认值（64KiB）。
+	SnapshotChunkSize int
+	// SnapshotRetryTicks 分块快照在未收到确认后重发当前块的 tick 间隔；0 使用默认值。
+	SnapshotRetryTicks int
+
 	// RandSeed 随机种子：测试固定种子保证可复现；传 0 时使用时间随机。
 	RandSeed int64
 }
@@ -30,10 +35,12 @@ type Config struct {
 // DefaultConfig 返回一份默认配置（调用方仍需填写 ID/Peers/DataDir）。
 func DefaultConfig() Config {
 	return Config{
-		TickInterval:      10 * time.Millisecond,
-		ElectionMin:       10, // 100ms
-		ElectionMax:       20, // 200ms
-		SnapshotThreshold: 50,
+		TickInterval:       10 * time.Millisecond,
+		ElectionMin:        10, // 100ms
+		ElectionMax:        20, // 200ms
+		SnapshotThreshold:  50,
+		SnapshotChunkSize:  64 * 1024,
+		SnapshotRetryTicks: 5, // 50ms
 	}
 }
 
@@ -66,6 +73,12 @@ func (c *Config) validate() error {
 	}
 	if c.SnapshotThreshold == 0 {
 		c.SnapshotThreshold = 50
+	}
+	if c.SnapshotChunkSize <= 0 {
+		c.SnapshotChunkSize = 64 * 1024
+	}
+	if c.SnapshotRetryTicks <= 0 {
+		c.SnapshotRetryTicks = 5
 	}
 	return nil
 }

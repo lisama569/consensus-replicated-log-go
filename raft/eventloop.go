@@ -75,7 +75,11 @@ func (n *Node) dispatch(ev internalEvent) {
 	case *RequestVoteRequest:
 		ev.resp <- n.handleRequestVote(r)
 	case *InstallSnapshotRequest:
-		ev.resp <- n.handleInstallSnapshot(r)
+		if r.Chunked {
+			ev.resp <- n.handleChunkedInstallSnapshot(r)
+		} else {
+			ev.resp <- n.handleInstallSnapshot(r)
+		}
 
 	// ---- 出站 RPC 的异步响应 ----
 	case voteResponse:
@@ -83,22 +87,37 @@ func (n *Node) dispatch(ev internalEvent) {
 	case appendResponse:
 		n.handleAppendResponse(r.peer, r.resp)
 	case snapshotResponse:
-		// 快照发送结果复用 AppendEntries 的推进逻辑。
-		if r.resp.success {
-			n.matchIndex[r.peer] = r.resp.lastIncluded
-			n.nextIndex[r.peer] = r.resp.lastIncluded + 1
-			n.broadcastAppendEntries()
-		} else if r.resp.term > n.term {
-			n.becomeFollower(r.resp.term)
-		}
+		n.handleSnapshotResponse(r.peer, r.resp)
 
 	// ---- 节点内调用 ----
 	case clientCall:
 		n.handleClientCall(r.req)
 	case statusCall:
 		r.res <- n.snapshotStatus()
+	case catchupCall:
+		switch r.op {
+		case catchupProgress:
+			r.res <- n.catchUpProgressLocked()
+		case catchupCancel:
+			r.done <- n.cancelCatchUpLocked()
+		case catchupResume:
+			r.done <- n.resumeCatchUpLocked()
+		}
+	case transfersCall:
+		r.res <- n.snapshotTransfersLocked()
+	case chunkTimeout:
+		// 分块请求/响应丢失：清在途标记，下一 tick 按断点重传。
+		if tr := n.snapXfers[r.peer]; tr != nil {
+			tr.inflight = false
+			tr.elapsed = 0
+		}
 	case thresholdCall:
 		n.cfg.SnapshotThreshold = r.threshold
+		r.done <- struct{}{}
+	case chunkSizeCall:
+		if r.bytes > 0 {
+			n.cfg.SnapshotChunkSize = r.bytes
+		}
 		r.done <- struct{}{}
 	case logRangeCall:
 		r.res <- indexRange{snap: n.snapMeta.LastIncludedIndex, last: n.lastLogIndex()}
@@ -111,6 +130,7 @@ func (n *Node) tick() {
 	case RoleLeader:
 		// 每个时钟周期发送心跳。
 		n.broadcastAppendEntries()
+		n.tickSnapshotTransfers()
 	default:
 		timeout := n.electionTimeout()
 		if n.electionElapsed >= timeout {
@@ -136,6 +156,8 @@ func (n *Node) becomeFollower(t Term) {
 	n.role = RoleFollower
 	n.leaderID = ""
 	n.grantedVotes = nil
+	// 失去领导权：全部在途分块发送会话作废（成为新领导者/重新成为领导者后重建）。
+	n.snapXfers = make(map[NodeID]*snapshotTransfer)
 	n.resetElectionTimer()
 }
 
@@ -165,6 +187,9 @@ func (n *Node) becomeLeader() {
 		n.nextIndex[p] = n.lastLogIndex() + 1
 		n.matchIndex[p] = 0
 	}
+	// 全新领导任期：旧的分块快照会话全部失效（becomeFollower 已清空，
+	// 这里也兜底重建，避免向已清空的 map 写入）。
+	n.snapXfers = make(map[NodeID]*snapshotTransfer)
 	n.debugf("became leader for term %d", n.term)
 
 	// 上任空日志：提交后即可证明本任期领导权（供线性一致读使用）。
@@ -188,5 +213,6 @@ func (n *Node) snapshotStatus() Status {
 		AppliedIndex:  n.lastApplied,
 		SnapshotIndex: n.snapMeta.LastIncludedIndex,
 		Peers:         peers,
+		CatchUp:       n.catchUpProgressLocked(),
 	}
 }

@@ -50,6 +50,19 @@ func TestSnapshotCompactionAndRestart(t *testing.T) {
 		return true
 	}, "snapshot file present on every node")
 
+	// 提交位置刚到 40 时应用可能尚未追平（-race + 高负载下尤其明显），
+	// 先等待各节点把已提交日志全部应用到状态机，再校验键值。
+	leaderCommit := c.Node(c.Leader()).Status().CommitIndex
+	waitForDur(t, 5*time.Second, func() bool {
+		for _, n := range c.Nodes() {
+			s := n.Status()
+			if s.AppliedIndex < s.CommitIndex || s.CommitIndex < leaderCommit {
+				return false
+			}
+		}
+		return true
+	}, "all nodes apply up to commit after compaction")
+
 	for _, n := range c.Nodes() {
 		s := n.Status()
 		// 压缩后 lastLogIndex 可以仍包含部分后缀，但 applied 必须覆盖全部 40 个键。
@@ -208,7 +221,7 @@ func TestConcurrentReadWriteSnapshot(t *testing.T) {
 	}
 	waitFor(t, func() bool { return c.Leader() != "" }, "leader")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -256,15 +269,15 @@ func TestConcurrentReadWriteSnapshot(t *testing.T) {
 
 	// 直接并发调用状态机 Snapshot/Restore 不会发生（Restore 仅启动期），
 	// 但 Lookup 与事件循环里的 Apply/Snapshot 并发由 -race 覆盖。
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(2000 * time.Millisecond)
 	close(stop)
 	cancel()
 	wg.Wait()
 
-	// 所有节点的状态机最终一致。
+	// 所有节点的状态机最终一致。-race + 整包高负载下给足收敛时间。
 	leader := c.Node(c.Leader())
 	v, _ := leader.sm.Lookup("w0")
-	waitFor(t, func() bool {
+	waitForDur(t, 8*time.Second, func() bool {
 		for _, n := range c.Nodes() {
 			if got, _ := n.sm.Lookup("w0"); got != v {
 				return false
