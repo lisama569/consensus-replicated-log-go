@@ -3,7 +3,8 @@
 //  2. 网络分区：少数派不能提交，多数派选出新主并继续写入；
 //  3. 分区恢复：旧领导者退位、日志收敛一致；
 //  4. 崩溃重启：已提交内容不丢失；
-//  5. 快照追赶：长期离线的节点通过 InstallSnapshot 追上。
+//  5. 快照追赶：长期离线的节点通过快照追上；
+//  6. 大快照分块续传：大状态机按块传输并报告接收/就绪进度。
 //
 // 运行：go run ./cmd/demo
 package main
@@ -12,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/lisama569/consensus-replicated-log-go/raft"
@@ -127,7 +129,55 @@ func main() {
 	fmt.Printf("   节点 %s 通过快照追至 snap=%d commit=%d\n", victim, s.SnapshotIndex, s.CommitIndex)
 	printStatus(c, "最终集群状态")
 
-	step("完成：分区、崩溃重启、消息重试、快照追赶下结果唯一且可复现")
+	step("8. 大快照分块续传（InstallSnapshotChunk）")
+	// 大状态机（每条值约 2KB，总快照远超默认 64KB 块大小）：
+	// 传输切成多个块，接收端持久化检查点；这里不主动制造中断，
+	// 只展示可查询的追赶进度与就绪状态。
+	must(c.Crash(victim))
+	const bigWrites = 80
+	for i := 0; i < bigWrites; i++ {
+		cli.SetNodes(live(c))
+		if _, _, err := cli.Set(ctx, fmt.Sprintf("big%d", i), strings.Repeat("z", 2000)); err != nil {
+			must(err)
+		}
+	}
+	fmt.Printf("   离线期间集群提交 %d 条大值（快照约 %dKB），节点 %s 需分块追赶\n",
+		bigWrites, bigWrites*2, victim)
+	must(c.Restart(victim))
+
+	// 打印至少一次“正在追赶”的进度（Receiving，已确认字节数）。
+	deadline := time.Now().Add(5 * time.Second)
+	printedReceiving := false
+	for time.Now().Before(deadline) {
+		cs := c.Node(victim).CatchupStatus()
+		if cs.State == raft.CatchupReceiving && !printedReceiving {
+			fmt.Printf("   正在追赶: state=%s target=snap%d received=%d/%d bytes\n",
+				cs.State, cs.Target, cs.Received, cs.Total)
+			printedReceiving = true
+		}
+		if cs.State == raft.CatchupDone {
+			fmt.Printf("   追赶完成: state=%s target=snap%d received=%d/%d bytes（节点就绪=%v）\n",
+				cs.State, cs.Target, cs.Received, cs.Total, cs.Ready())
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !printedReceiving {
+		fmt.Println("   （传输较快，未抓到中间进度；状态机最终仍须完整）")
+	}
+	wait(func() bool {
+		n := c.Node(victim)
+		if n == nil {
+			return false
+		}
+		v, ok := lookup(c, victim, fmt.Sprintf("big%d", bigWrites-1))
+		return ok && len(v) == 2000
+	})
+	final := c.Node(victim).CatchupStatus()
+	fmt.Printf("   最终追赶状态: %s target=snap%d ready=%v\n",
+		final.State, final.Target, final.Ready())
+	printStatus(c, "分块追赶后集群状态")
+	step("完成：分区、崩溃重启、消息重试、整份/分块快照追赶下结果唯一且可复现")
 }
 
 func step(title string) {

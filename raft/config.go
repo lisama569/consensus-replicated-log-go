@@ -23,6 +23,11 @@ type Config struct {
 	// SnapshotThreshold 快照之后增量日志达到该条数时触发一次压缩。
 	SnapshotThreshold uint64
 
+	// SnapshotChunkSize 大快照分块传输的块大小（字节）。
+	// 快照字节数不超过该值时仍走一次性 InstallSnapshot（兼容旧路径）；
+	// 超过则切换为可分块、可断点续传的 InstallSnapshotChunk。
+	SnapshotChunkSize int
+
 	// RandSeed 随机种子：测试固定种子保证可复现；传 0 时使用时间随机。
 	RandSeed int64
 }
@@ -34,6 +39,7 @@ func DefaultConfig() Config {
 		ElectionMin:       10, // 100ms
 		ElectionMax:       20, // 200ms
 		SnapshotThreshold: 50,
+		SnapshotChunkSize: 64 * 1024,
 	}
 }
 
@@ -66,6 +72,9 @@ func (c *Config) validate() error {
 	}
 	if c.SnapshotThreshold == 0 {
 		c.SnapshotThreshold = 50
+	}
+	if c.SnapshotChunkSize <= 0 {
+		c.SnapshotChunkSize = 64 * 1024
 	}
 	return nil
 }

@@ -30,6 +30,27 @@ type thresholdCall struct {
 	done      chan struct{}
 }
 
+// SetSnapshotChunkSize 在事件循环内修改分块大小（测试用，避免并发读写 Config）。
+func (n *Node) SetSnapshotChunkSize(size int) {
+	ch := make(chan struct{}, 1)
+	ev := internalEvent{kind: eventRPC, from: n.cfg.ID,
+		rpc: chunkSizeCall{size: size, done: ch}}
+	select {
+	case n.events <- ev:
+	case <-n.stopCh:
+		return
+	}
+	select {
+	case <-ch:
+	case <-n.stopCh:
+	}
+}
+
+type chunkSizeCall struct {
+	size int
+	done chan struct{}
+}
+
 // indexRange 是日志覆盖范围。
 type indexRange struct{ snap, last Index }
 

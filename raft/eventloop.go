@@ -76,6 +76,8 @@ func (n *Node) dispatch(ev internalEvent) {
 		ev.resp <- n.handleRequestVote(r)
 	case *InstallSnapshotRequest:
 		ev.resp <- n.handleInstallSnapshot(r)
+	case *InstallSnapshotChunkRequest:
+		ev.resp <- n.handleInstallSnapshotChunk(r)
 
 	// ---- 出站 RPC 的异步响应 ----
 	case voteResponse:
@@ -91,6 +93,8 @@ func (n *Node) dispatch(ev internalEvent) {
 		} else if r.resp.term > n.term {
 			n.becomeFollower(r.resp.term)
 		}
+	case snapshotChunkResponse:
+		n.handleSnapshotChunkResponse(r.peer, r.sessionID, r.resp)
 
 	// ---- 节点内调用 ----
 	case clientCall:
@@ -100,17 +104,42 @@ func (n *Node) dispatch(ev internalEvent) {
 	case thresholdCall:
 		n.cfg.SnapshotThreshold = r.threshold
 		r.done <- struct{}{}
+	case chunkSizeCall:
+		n.cfg.SnapshotChunkSize = r.size
+		r.done <- struct{}{}
 	case logRangeCall:
 		r.res <- indexRange{snap: n.snapMeta.LastIncludedIndex, last: n.lastLogIndex()}
+	case catchupStatusCall:
+		r.res <- n.catchup
+	case cancelCatchupCall:
+		if n.incoming == nil {
+			r.res <- false
+		} else {
+			n.cancelIncoming(CatchupCancelled, "cancelled by user")
+			r.res <- true
+		}
 	}
 }
 
 func (n *Node) tick() {
+	n.tickCount++
 	n.electionElapsed++
 	switch n.role {
 	case RoleLeader:
 		// 每个时钟周期发送心跳。
 		n.broadcastAppendEntries()
+		// 分块快照块在途期间，接收端可能长时间收不到任何消息
+		// （块超时重传窗口大于选举超时）：补一个快照边界心跳，
+		// 避免大快照传输引发无谓的选举。只从 tick 路径发送，
+		// 拒绝回退路径不补，避免事件风暴。
+		for _, p := range n.cfg.Peers {
+			if p == n.cfg.ID {
+				continue
+			}
+			if out := n.snapOut[p]; out != nil && out.InFlight {
+				n.sendSnapshotHeartbeat(p)
+			}
+		}
 	default:
 		timeout := n.electionTimeout()
 		if n.electionElapsed >= timeout {
@@ -136,6 +165,8 @@ func (n *Node) becomeFollower(t Term) {
 	n.role = RoleFollower
 	n.leaderID = ""
 	n.grantedVotes = nil
+	// 下台即放弃全部在途的分块快照发送（响应会因角色/任期不匹配被忽略）。
+	n.snapOut = make(map[NodeID]*outgoingSnapshot)
 	n.resetElectionTimer()
 }
 
@@ -146,6 +177,7 @@ func (n *Node) becomeCandidate() {
 	n.persistState()
 	n.grantedVotes = map[NodeID]bool{n.cfg.ID: true}
 	n.leaderID = ""
+	n.snapOut = make(map[NodeID]*outgoingSnapshot)
 	n.resetElectionTimer()
 	n.debugf("became candidate, requesting votes from peers")
 	n.requestVotes()

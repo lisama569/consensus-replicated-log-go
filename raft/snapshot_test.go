@@ -34,11 +34,25 @@ func TestSnapshotCompactionAndRestart(t *testing.T) {
 	cli := NewClient("snap", nodesOf(c)...)
 	ctx, cancel := context.WithTimeout(context.Background(), waitShort)
 	defer cancel()
+	var lastIdx Index
 	for i := 0; i < 40; i++ {
-		if _, _, err := cli.Set(ctx, key(i), val(i)); err != nil {
+		idx, _, err := cli.Set(ctx, key(i), val(i))
+		if err != nil {
 			t.Fatalf("set %d: %v", i, err)
 		}
+		lastIdx = idx
 	}
+
+	// 等所有节点把最后一次写入应用完再校验（快照文件可能远早于此产生，
+	// 只看快照文件存在不足以保证状态机已追平）。
+	waitFor(t, func() bool {
+		for _, n := range c.Nodes() {
+			if n.Status().AppliedIndex < lastIdx {
+				return false
+			}
+		}
+		return true
+	}, "all nodes applied every write")
 
 	// 所有节点都应已产生快照，且日志后缀被截断。
 	waitFor(t, func() bool {

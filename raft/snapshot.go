@@ -56,6 +56,11 @@ func (n *Node) takeSnapshot(index Index) {
 	if err := n.persistLog(); err != nil {
 		n.logf("[%s] rewrite log after compaction error: %v", n.cfg.ID, err)
 	}
+
+	// 本地压缩点推进后，目标不超过新快照点的在途分块接收已无意义，取消它。
+	if n.incoming != nil && n.incoming.Meta.LastIncludedIndex <= n.snapMeta.LastIncludedIndex {
+		n.cancelIncoming(CatchupCancelled, "superseded by local compaction")
+	}
 	n.debugf("compacted: snapshot index %d->%d, retained suffix entries=%d",
 		oldLast, meta.LastIncludedIndex, len(n.log)-1)
 }
@@ -80,11 +85,22 @@ func (n *Node) loadSnapshotBytes() ([]byte, bool) {
 	return data, true
 }
 
-// sendSnapshot 领导者向 peer 发送 InstallSnapshot。
-func (n *Node) sendSnapshot(peer NodeID) {
+// sendSnapshot 领导者向 peer 发送快照，返回本轮是否真正发出了 RPC。
+// 快照不超过配置块大小时走一次性 InstallSnapshot（兼容旧路径）；
+// 大快照切换为可分块、可断点续传的 InstallSnapshotChunk。
+func (n *Node) sendSnapshot(peer NodeID) bool {
+	// 分块会话在途且未超时：本轮无块可发。
+	// 提前返回，避免每个 tick/每次拒绝回退都把整份快照从磁盘读进内存。
+	if out := n.snapOut[peer]; out != nil && out.InFlight &&
+		n.tickCount-out.LastSend < chunkResendTicks {
+		return false
+	}
 	data, ok := n.loadSnapshotBytes()
 	if !ok {
-		return
+		return false
+	}
+	if len(data) > n.cfg.SnapshotChunkSize {
+		return n.sendSnapshotChunked(peer, data)
 	}
 	req := &InstallSnapshotRequest{
 		Term:              n.term,
@@ -108,6 +124,32 @@ func (n *Node) sendSnapshot(peer NodeID) {
 		}
 		select {
 		case n.events <- internalEvent{kind: eventRPC, rpc: snapshotResponse{peer: peer, resp: result}}:
+		case <-n.stopCh:
+		}
+	}()
+	return true
+}
+
+// sendSnapshotHeartbeat 在分块快照传输的静默窗口内向 peer 发一个空 AppendEntries
+// （prevLogIndex 取快照边界）：跟随者即使日志不匹配而拒绝，也会重置选举计时器，
+// 避免大快照传输期间触发无谓的选举。
+func (n *Node) sendSnapshotHeartbeat(peer NodeID) {
+	req := &AppendEntriesRequest{
+		Term:         n.term,
+		LeaderID:     n.cfg.ID,
+		PrevLogIndex: n.snapMeta.LastIncludedIndex,
+		PrevLogTerm:  n.snapMeta.LastIncludedTerm,
+		LeaderCommit: n.commitIndex,
+	}
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		resp := n.tr.SendAppendEntries(context.Background(), peer, req)
+		if resp == nil {
+			return
+		}
+		select {
+		case n.events <- internalEvent{kind: eventRPC, rpc: appendResponse{peer: peer, resp: resp}}:
 		case <-n.stopCh:
 		}
 	}()
@@ -139,15 +181,33 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 		return resp
 	}
 
-	// 1. 先落盘快照。
-	meta := SnapshotMeta{LastIncludedIndex: req.LastIncludedIndex, LastIncludedTerm: req.LastIncludedTerm}
-	if err := n.store.SaveSnapshot(meta, req.Data); err != nil {
-		n.logf("[%s] save received snapshot error: %v", n.cfg.ID, err)
-		return resp
+	// 整份快照取代任何在途的分块会话。
+	if n.incoming != nil {
+		n.cancelIncoming(CatchupCancelled, "superseded by whole-snapshot install")
 	}
 
-	// 2. 重置内存日志：占位项 + 快照点之后仍连续匹配的后缀（论文规则）。
-	//    必须先用旧 snapMeta 计算要保留的后缀，再切换 snapMeta。
+	meta := SnapshotMeta{LastIncludedIndex: req.LastIncludedIndex, LastIncludedTerm: req.LastIncludedTerm}
+	if n.installSnapshot(meta, req.Data) {
+		resp.Success = true
+	}
+	return resp
+}
+
+// installSnapshot 把一份完整快照安装到本节点（整份 RPC 与分块组装完成共用）：
+//  1. 先落盘快照；
+//  2. 重置内存日志：占位项 + 快照点之后仍连续匹配的后缀（论文规则）；
+//  3. 恢复状态机到快照内容；
+//  4. 提交/应用位置至少追到快照点，并继续应用保留的已提交后缀。
+//
+// 调用前必须保证 meta.LastIncludedIndex > snapMeta.LastIncludedIndex。
+func (n *Node) installSnapshot(meta SnapshotMeta, data []byte) bool {
+	// 1. 先落盘快照。
+	if err := n.store.SaveSnapshot(meta, data); err != nil {
+		n.logf("[%s] save received snapshot error: %v", n.cfg.ID, err)
+		return false
+	}
+
+	// 2. 重置内存日志：必须先用旧 snapMeta 计算要保留的后缀，再切换 snapMeta。
 	kept := []LogEntry{{Index: meta.LastIncludedIndex, Term: meta.LastIncludedTerm}}
 	if n.lastLogIndex() >= meta.LastIncludedIndex+1 {
 		if e, ok := n.entryAt(meta.LastIncludedIndex + 1); ok {
@@ -164,23 +224,22 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 	}
 
 	// 3. 恢复状态机到快照内容。
-	if err := n.sm.Restore(req.Data); err != nil {
+	if err := n.sm.Restore(data); err != nil {
 		n.logf("[%s] restore snapshot error: %v", n.cfg.ID, err)
-		return resp
+		return false
 	}
 
 	// 4. 提交位置/应用位置至少追到快照点。
-	if req.LastIncludedIndex > n.commitIndex {
-		n.commitIndex = req.LastIncludedIndex
+	if meta.LastIncludedIndex > n.commitIndex {
+		n.commitIndex = meta.LastIncludedIndex
 	}
-	if req.LastIncludedIndex > n.lastApplied {
-		n.lastApplied = req.LastIncludedIndex
+	if meta.LastIncludedIndex > n.lastApplied {
+		n.lastApplied = meta.LastIncludedIndex
 	}
 	// 若保留了快照点之后的已提交条目，继续应用。
 	n.applyCommitted()
 
 	n.debugf("installed snapshot through index=%d term=%d (commit=%d applied=%d suffix=%d)",
 		meta.LastIncludedIndex, meta.LastIncludedTerm, n.commitIndex, n.lastApplied, len(n.log)-1)
-	resp.Success = true
-	return resp
+	return true
 }

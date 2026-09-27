@@ -150,6 +150,8 @@ func TestNotLeaderReject(t *testing.T) {
 			break
 		}
 	}
+	// 等跟随者收到心跳、确知现任领导者，再验证拒绝时附带领导提示。
+	waitFor(t, func() bool { return follower.Status().LeaderID != "" }, "follower learns leader")
 	ctx := context.Background()
 	_, err := follower.SubmitProposal(ctx, Command{Op: OpSet, Key: "x", Value: "y"})
 	if !errors.Is(err, ErrNotLeader) {

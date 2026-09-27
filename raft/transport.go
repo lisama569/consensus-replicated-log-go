@@ -18,6 +18,7 @@ type Transport interface {
 	SendAppendEntries(ctx context.Context, to NodeID, req *AppendEntriesRequest) *AppendEntriesResponse
 	SendRequestVote(ctx context.Context, to NodeID, req *RequestVoteRequest) *RequestVoteResponse
 	SendInstallSnapshot(ctx context.Context, to NodeID, req *InstallSnapshotRequest) *InstallSnapshotResponse
+	SendInstallSnapshotChunk(ctx context.Context, to NodeID, req *InstallSnapshotChunkRequest) *InstallSnapshotChunkResponse
 }
 
 // FaultPolicy 描述模拟网络对 from->to 方向、某类 RPC 的故障注入策略。
@@ -124,7 +125,7 @@ func (t *MemoryTransport) SetPartitionGroup(members []NodeID, isolated bool) {
 			}
 			inA, inB := set[from], set[to]
 			if inA != inB {
-				for _, k := range []RPCKind{RPCAppendEntries, RPCRequestVote, RPCInstallSnapshot} {
+				for _, k := range []RPCKind{RPCAppendEntries, RPCRequestVote, RPCInstallSnapshot, RPCInstallSnapshotChunk} {
 					t.policies[policyKey{from, to, k}] = FaultPolicy{DropRate: 1}
 				}
 			}
@@ -144,7 +145,7 @@ func (t *MemoryTransport) HealAll() {
 func (t *MemoryTransport) clearPoliciesBetween(from, to NodeID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for _, k := range []RPCKind{RPCAppendEntries, RPCRequestVote, RPCInstallSnapshot} {
+	for _, k := range []RPCKind{RPCAppendEntries, RPCRequestVote, RPCInstallSnapshot, RPCInstallSnapshotChunk} {
 		delete(t.policies, policyKey{from, to, k})
 	}
 }
@@ -207,4 +208,12 @@ func (t *MemoryTransport) SendInstallSnapshot(ctx context.Context, to NodeID, re
 		return nil
 	}
 	return r.(*InstallSnapshotResponse)
+}
+
+func (t *MemoryTransport) SendInstallSnapshotChunk(ctx context.Context, to NodeID, req *InstallSnapshotChunkRequest) *InstallSnapshotChunkResponse {
+	r := t.deliver(req.LeaderID, to, RPCInstallSnapshotChunk, req)
+	if r == nil {
+		return nil
+	}
+	return r.(*InstallSnapshotChunkResponse)
 }

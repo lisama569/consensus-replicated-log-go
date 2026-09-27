@@ -81,6 +81,14 @@ func (c *Cluster) SetSnapshotThreshold(id NodeID, n uint64) {
 	c.cfgs[id] = cfg
 }
 
+// SetSnapshotChunkSize 设置分块大小（对尚未创建的节点生效；
+// 对已运行节点请用 Node.SetSnapshotChunkSize）。
+func (c *Cluster) SetSnapshotChunkSize(id NodeID, n int) {
+	cfg := c.cfgs[id]
+	cfg.SnapshotChunkSize = n
+	c.cfgs[id] = cfg
+}
+
 func (c *Cluster) Nodes() map[NodeID]*Node { return c.nodes }
 
 func (c *Cluster) Node(id NodeID) *Node { return c.nodes[id] }

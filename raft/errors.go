@@ -13,6 +13,8 @@ const (
 	RejectNotLeader      RejectReason = "not_leader"         // 本节点不是领导者（客户端请求）
 	RejectLeaderDeposed  RejectReason = "leader_deposed"     // 领导者在提交前发现更高任期，已被废黜
 	RejectSteppedDown    RejectReason = "stepped_down"       // 节点已关闭/下台，无法处理
+	RejectSnapshotGap    RejectReason = "snapshot_gap"       // 快照块偏移不连续（乱序/空洞），需从 NextOffset 重发
+	RejectSnapshotStale  RejectReason = "snapshot_stale"     // 快照会话过旧（本节点已有更新进度），不予接收
 )
 
 // 可用于 errors.Is 的哨兵错误。

@@ -92,7 +92,9 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 	}
 	ni := n.nextIndex[peer]
 
-	// peer 落后到快照覆盖范围之前：改用 InstallSnapshot 追赶。
+	// peer 落后到快照覆盖范围之前：改用快照追赶。
+	// （分块在途静默期的补心跳只由 tick 周期路径发出，见 tick()；
+	// 拒绝回退路径不得补心跳，否则会形成 拒绝->回退->心跳->拒绝 的事件风暴。）
 	if ni <= n.snapMeta.LastIncludedIndex {
 		n.sendSnapshot(peer)
 		return
@@ -291,10 +293,9 @@ func (n *Node) backoffPeer(peer NodeID, resp *AppendEntriesResponse) {
 	default:
 		n.nextIndex[peer] = 1
 	}
-	// 快照边界兜底。
-	if min := n.snapMeta.LastIncludedIndex + 1; n.nextIndex[peer] < min {
-		n.nextIndex[peer] = min
-	}
+	// 注意：不要把 nextIndex 钳到快照点之后。跟随者整体落后到快照覆盖范围时，
+	// 必须让 nextIndex 落入快照区间，sendAppendEntries 才会切换到快照追赶路径；
+	// 钳在快照点之后会让领导者空发 AppendEntries、跟随者无限拒绝。
 	n.sendAppendEntries(peer)
 }
 

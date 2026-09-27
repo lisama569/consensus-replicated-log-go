@@ -12,6 +12,9 @@ const (
 	stateFile    = "state.json"
 	logFile      = "log.json"
 	snapshotFile = "snapshot.json"
+	// 分块快照接收中的检查点与部分数据（可恢复续传）。
+	incomingMetaFile = "snapshot.incoming.json"
+	incomingDataFile = "snapshot.incoming"
 )
 
 // SnapshotMeta 描述快照覆盖范围。
@@ -46,6 +49,11 @@ type FileStore struct {
 	memSnap  *persistedSnapshot
 	hasState bool
 	hasSnap  bool
+
+	// 分块接收（内存模式）与数据文件句柄（文件模式）。
+	memIncoming     *persistedIncoming
+	memIncomingData []byte
+	incFile         *os.File
 }
 
 // OpenStore 打开（不存在则初始化）数据目录。
@@ -60,8 +68,15 @@ func OpenStore(dir string) (*FileStore, error) {
 	return s, nil
 }
 
-// Close 刷新并关闭（当前实现每次写入即 fsync，这里仅作占位）。
-func (s *FileStore) Close() error { return nil }
+// Close 刷新并关闭（当前实现每次写入即 fsync，这里关闭部分数据文件句柄）。
+func (s *FileStore) Close() error {
+	if s.incFile != nil {
+		err := s.incFile.Close()
+		s.incFile = nil
+		return err
+	}
+	return nil
+}
 
 // ---- 硬状态 ----
 
@@ -135,8 +150,118 @@ func (s *FileStore) HasSnapshot() bool {
 	return err == nil
 }
 
-// ---- 日志 ----
+// ---- 分块快照接收（可恢复续传） ----
 
+// persistedIncoming 是分块接收会话的检查点（崩溃后可从此续传）。
+type persistedIncoming struct {
+	SessionID         string `json:"session_id"`
+	LastIncludedIndex Index  `json:"last_included_index"`
+	LastIncludedTerm  Term   `json:"last_included_term"`
+	Term              Term   `json:"term"`
+	Total             uint64 `json:"total"`
+	Received          uint64 `json:"received"`
+	CRC               uint32 `json:"crc"`
+}
+
+// SaveIncomingCheckpoint 原子持久化接收检查点（先写数据、后更新检查点，
+// 崩溃时数据文件可能多于检查点，加载时按检查点截断，绝不少收）。
+func (s *FileStore) SaveIncomingCheckpoint(p persistedIncoming) error {
+	if s.dir == "" {
+		cp := p
+		s.memIncoming = &cp
+		return nil
+	}
+	return writeJSONAtomic(filepath.Join(s.dir, incomingMetaFile), &p)
+}
+
+// AppendIncomingChunk 把一块数据追加到部分快照文件的 offset 处并 fsync。
+// 接收端保证只追加连续前缀（offset == 已确认长度），重复前缀不会走到这里。
+func (s *FileStore) AppendIncomingChunk(offset uint64, data []byte) error {
+	if s.dir == "" {
+		if offset != uint64(len(s.memIncomingData)) {
+			return errors.New("raft: incoming chunk offset mismatch")
+		}
+		s.memIncomingData = append(s.memIncomingData, data...)
+		return nil
+	}
+	f, err := s.incomingFile()
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteAt(data, int64(offset)); err != nil {
+		return err
+	}
+	// 截断到写入末尾：防御性清理可能残留的旧会话尾部字节。
+	if err := f.Truncate(int64(offset) + int64(len(data))); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// incomingFile 懒打开部分数据文件句柄（避免每块开关文件）。
+func (s *FileStore) incomingFile() (*os.File, error) {
+	if s.incFile != nil {
+		return s.incFile, nil
+	}
+	f, err := os.OpenFile(filepath.Join(s.dir, incomingDataFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	s.incFile = f
+	return f, nil
+}
+
+// LoadIncoming 读取接收检查点与已确认的部分数据；无在途会话时返回 nil。
+// 数据文件可能比检查点长（写完数据、未写检查点时崩溃），按检查点长度截断。
+func (s *FileStore) LoadIncoming() (*persistedIncoming, []byte, error) {
+	if s.dir == "" {
+		if s.memIncoming == nil {
+			return nil, nil, nil
+		}
+		cp := *s.memIncoming
+		data := append([]byte(nil), s.memIncomingData...)
+		if uint64(len(data)) > cp.Received {
+			data = data[:cp.Received]
+		}
+		return &cp, data, nil
+	}
+	var p persistedIncoming
+	ok, err := readJSON(filepath.Join(s.dir, incomingMetaFile), &p)
+	if err != nil || !ok {
+		return nil, nil, err
+	}
+	raw, err := os.ReadFile(filepath.Join(s.dir, incomingDataFile))
+	if errors.Is(err, os.ErrNotExist) {
+		raw = nil
+	} else if err != nil {
+		return nil, nil, err
+	}
+	if uint64(len(raw)) > p.Received {
+		raw = raw[:p.Received]
+	}
+	return &p, raw, nil
+}
+
+// ClearIncoming 删除在途会话的检查点与部分数据（安装完成/取消/被取代时调用）。
+func (s *FileStore) ClearIncoming() error {
+	if s.dir == "" {
+		s.memIncoming = nil
+		s.memIncomingData = nil
+		return nil
+	}
+	if s.incFile != nil {
+		_ = s.incFile.Close()
+		s.incFile = nil
+	}
+	for _, f := range []string{incomingMetaFile, incomingDataFile} {
+		if err := os.Remove(filepath.Join(s.dir, f)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---- 日志 ----
 // SaveLogSuffix 用 entries 整体替换日志文件。
 // entries 必须是快照之后的全部日志（索引严格大于快照最后索引）。
 func (s *FileStore) SaveLogSuffix(entries []LogEntry) error {

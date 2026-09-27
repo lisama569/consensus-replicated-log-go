@@ -58,6 +58,13 @@ type Node struct {
 	// pendingReads 是领导者在途的线性一致读队列。
 	pendingReads []*readState
 
+	// 分块快照：接收端在途会话（检查点持久化）与可观测进度；
+	// snapOut 是领导者对每个 peer 的在途发送状态（易失）。
+	incoming  *incomingSnapshot
+	catchup   CatchupStatus
+	snapOut   map[NodeID]*outgoingSnapshot
+	tickCount int
+
 	electionElapsed int
 	rng             *rand.Rand
 
@@ -92,6 +99,8 @@ func NewNode(cfg Config, tr Transport) (*Node, error) {
 		matchIndex: make(map[NodeID]Index),
 		proposals:  make(map[Index][]chan clientOutcome),
 		appliedSeq: make(map[string]appliedSeqEntry),
+		snapOut:    make(map[NodeID]*outgoingSnapshot),
+		catchup:    CatchupStatus{State: CatchupIdle},
 		events:     make(chan internalEvent, 256),
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
@@ -152,6 +161,37 @@ func (n *Node) restore() error {
 			return fmt.Errorf("log suffix gap: want index %d, got %d", want, entries[0].Index)
 		}
 		n.log = append(n.log, entries...)
+	}
+
+	// 恢复在途的分块快照接收会话（可跨重启续传）；
+	// 目标已被本地快照覆盖的残留会话直接丢弃。
+	p, _, err := n.store.LoadIncoming()
+	if err != nil {
+		return fmt.Errorf("load incoming snapshot: %w", err)
+	}
+	if p != nil {
+		if p.LastIncludedIndex > n.snapMeta.LastIncludedIndex {
+			n.incoming = &incomingSnapshot{
+				SessionID: p.SessionID,
+				Meta: SnapshotMeta{
+					LastIncludedIndex: p.LastIncludedIndex,
+					LastIncludedTerm:  p.LastIncludedTerm,
+				},
+				Term:     p.Term,
+				Total:    p.Total,
+				Received: p.Received,
+				CRC:      p.CRC,
+			}
+			n.catchup = CatchupStatus{
+				State:     CatchupReceiving,
+				SessionID: p.SessionID,
+				Target:    p.LastIncludedIndex,
+				Received:  p.Received,
+				Total:     p.Total,
+			}
+		} else if err := n.store.ClearIncoming(); err != nil {
+			return fmt.Errorf("clear stale incoming snapshot: %w", err)
+		}
 	}
 	return nil
 }
