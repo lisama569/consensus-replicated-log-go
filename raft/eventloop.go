@@ -106,10 +106,12 @@ func (n *Node) dispatch(ev internalEvent) {
 	case transfersCall:
 		r.res <- n.snapshotTransfersLocked()
 	case chunkTimeout:
-		// 分块请求/响应丢失：清在途标记，下一 tick 按断点重传。
-		if tr := n.snapXfers[r.peer]; tr != nil {
+		// 分块请求/响应丢失：立即按断点重传当前块（transmitChunk 会递增
+		// attempt，因此即使“丢失”的响应稍后才到，也会因 attempt 不符被丢弃）。
+		if tr := n.snapXfers[r.peer]; tr != nil && tr.inflight && !tr.done && tr.backoff == 0 {
 			tr.inflight = false
 			tr.elapsed = 0
+			n.transmitChunk(r.peer, tr)
 		}
 	case thresholdCall:
 		n.cfg.SnapshotThreshold = r.threshold
@@ -158,6 +160,8 @@ func (n *Node) becomeFollower(t Term) {
 	n.grantedVotes = nil
 	// 失去领导权：全部在途分块发送会话作废（成为新领导者/重新成为领导者后重建）。
 	n.snapXfers = make(map[NodeID]*snapshotTransfer)
+	n.knownEpoch = make(map[NodeID]uint64)
+	n.knownEpochOK = make(map[NodeID]bool)
 	n.resetElectionTimer()
 }
 
@@ -190,6 +194,8 @@ func (n *Node) becomeLeader() {
 	// 全新领导任期：旧的分块快照会话全部失效（becomeFollower 已清空，
 	// 这里也兜底重建，避免向已清空的 map 写入）。
 	n.snapXfers = make(map[NodeID]*snapshotTransfer)
+	n.knownEpoch = make(map[NodeID]uint64)
+	n.knownEpochOK = make(map[NodeID]bool)
 	n.debugf("became leader for term %d", n.term)
 
 	// 上任空日志：提交后即可证明本任期领导权（供线性一致读使用）。

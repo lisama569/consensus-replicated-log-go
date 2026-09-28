@@ -32,6 +32,9 @@ type incomingSnapshot struct {
 }
 
 // snapshotTransfer 是领导者面向某个 peer 的一个快照发送会话。
+// 会话一旦建立就“钉住”自己的快照身份：追赶期间领导者持续压缩只会产生
+// 更新的快照，而不会打断进行中的传输，避免接收端字节进度反复掉 0。
+// 当前快照安装完成（或确认无法继续）后，下一轮心跳再用最新快照开新会话。
 type snapshotTransfer struct {
 	id       uint64
 	term     Term
@@ -40,11 +43,14 @@ type snapshotTransfer struct {
 	checksum []byte
 	data     []byte
 
-	offset   uint64 // 下一个待发送块的起始偏移
-	inflight bool   // 当前是否有在途块
-	elapsed  int    // 在途块已经等待的 tick 数
-	backoff  int    // 对端要求等待（如被取消）时的剩余 tick
-	done     bool   // 对端已完整安装
+	offset    uint64 // 下一个待发送块的起始偏移
+	inflight  bool   // 当前是否有在途块
+	attempt   uint64 // 当前块的发送序号（每次发送递增），用于丢弃过期/重复响应
+	elapsed   int    // 在途块已经等待的 tick 数
+	backoff   int    // 对端要求等待（如被取消）时的剩余 tick
+	done      bool   // 对端已完整安装
+	epoch     uint64 // 对端最近一次响应中的接收代际（取消后旧代际成功响应必须作废）
+	haveEpoch bool   // 是否已从对端收到过 epoch
 }
 
 // ---- 领导者：发送侧 ----
@@ -76,15 +82,23 @@ func (n *Node) startSnapshotTransfer(peer NodeID) {
 			checksum:     string(tr.checksum),
 		}
 		switch {
-		case id != cur:
-			// 领导者压缩出了新快照（或重启后读到新快照）：旧会话作废，从 0 重发新快照。
-			n.debugf("peer %s snapshot session stale (%d->%d), restart transfer",
+		case id != cur && !tr.done:
+			// 会话钉住创建时的快照身份：追赶期间领导者压缩出的更新快照
+			// 不会打断进行中的传输（否则接收端会反复从 0 重来）。
+			// 当前快照安装完成后，本会话被移除，再由下方逻辑用最新快照开新会话。
+			n.debugf("peer %s transfer pinned at snapshot %d (newer %d available)",
 				peer, tr.meta.LastIncludedIndex, meta.LastIncludedIndex)
+			// 落到函数末尾统一按“在途/退避/空闲”决定是否发块。
+		case id != cur && tr.done:
+			// 对端已完整安装旧快照：丢弃旧会话记录，按最新快照决定下一步。
+			n.dropTransfer(peer)
 			tr = nil
 		case tr.done:
 			// 对端已完整安装：常规 AppendEntries 会接管；
 			// 若它仍落后于快照点（理论上不会），下面的推进逻辑兜底。
-			n.matchIndex[peer] = tr.meta.LastIncludedIndex
+			if tr.meta.LastIncludedIndex > n.matchIndex[peer] {
+				n.matchIndex[peer] = tr.meta.LastIncludedIndex
+			}
 			n.nextIndex[peer] = tr.meta.LastIncludedIndex + 1
 			n.sendAppendEntries(peer)
 			return
@@ -98,16 +112,18 @@ func (n *Node) startSnapshotTransfer(peer NodeID) {
 	if tr == nil {
 		n.nextTransferID++
 		tr = &snapshotTransfer{
-			id:       n.nextTransferID,
-			term:     n.term,
-			meta:     meta,
-			length:   uint64(len(data)),
-			checksum: sum,
-			data:     data,
+			id:        n.nextTransferID,
+			term:      n.term,
+			meta:      meta,
+			length:    uint64(len(data)),
+			checksum:  sum,
+			data:      data,
+			haveEpoch: n.knownEpochOK[peer],
+			epoch:     n.knownEpoch[peer],
 		}
 		n.snapXfers[peer] = tr
-		n.debugf("start chunked snapshot transfer to %s: id=%d index=%d bytes=%d chunk=%d",
-			peer, tr.id, meta.LastIncludedIndex, tr.length, n.cfg.SnapshotChunkSize)
+		n.debugf("start chunked snapshot transfer to %s: id=%d index=%d bytes=%d chunk=%d epoch=%d",
+			peer, tr.id, meta.LastIncludedIndex, tr.length, n.cfg.SnapshotChunkSize, tr.epoch)
 	}
 	n.transmitChunk(peer, tr)
 }
@@ -126,6 +142,7 @@ func (n *Node) transmitChunk(peer NodeID, tr *snapshotTransfer) {
 		end = tr.length
 	}
 	chunk := tr.data[tr.offset:end]
+	tr.attempt++
 	req := &InstallSnapshotRequest{
 		Term:              n.term,
 		LeaderID:          n.cfg.ID,
@@ -133,6 +150,7 @@ func (n *Node) transmitChunk(peer NodeID, tr *snapshotTransfer) {
 		LastIncludedTerm:  tr.meta.LastIncludedTerm,
 		Chunked:           true,
 		TransferID:        tr.id,
+		Attempt:           tr.attempt,
 		Offset:            tr.offset,
 		Length:            tr.length,
 		Checksum:          tr.checksum,
@@ -182,9 +200,11 @@ func (n *Node) tickOneTransfer(peer NodeID, tr *snapshotTransfer) {
 	if tr.inflight {
 		tr.elapsed++
 		if tr.elapsed >= n.cfg.SnapshotRetryTicks {
+			n.debugf("snapshot chunk timeout peer=%s offset=%d attempt=%d, retransmit",
+				peer, tr.offset, tr.attempt)
 			tr.inflight = false
-			n.debugf("snapshot chunk timeout peer=%s offset=%d, retransmit", peer, tr.offset)
-			n.transmitChunk(peer, tr)
+			tr.elapsed = 0
+			n.transmitChunk(peer, tr) // transmitChunk 会把 attempt+1，旧响应因此失效
 		}
 	}
 }
@@ -214,6 +234,37 @@ func (n *Node) handleSnapshotResponse(peer NodeID, r *installResult) {
 	if tr == nil || tr.done {
 		return
 	}
+	// 会话相关性：领导权变化、压缩换会话、取消重开都会产生新 TransferID；
+	// 旧会话迟到的响应绝不能改动当前会话（否则会用旧快照的进度“顶掉”新快照，
+	// 造成 matchIndex 虚报、随后陷入 AppendEntries 拒绝风暴）。
+	if r.transferID != tr.id {
+		n.debugf("drop stale snapshot response peer=%s respTransfer=%d curTransfer=%d",
+			peer, r.transferID, tr.id)
+		return
+	}
+	// 发送相关性：正常流程下收到响应时必然有一个在途块（请求超时会立即重传）。
+	// 重复投递（网络 Duplicate）或超时重传后的迟到响应，其 attempt 与当前在途
+	// 块不符时一律忽略，避免同一个成功被应用两次、或用旧块进度错误推进 offset。
+	if !tr.inflight || r.attempt != tr.attempt {
+		n.debugf("drop non-correlated chunk response peer=%s resp=%d cur=%d inflight=%v",
+			peer, r.attempt, tr.attempt, tr.inflight)
+		return
+	}
+
+	// 接收代际：对端 CancelCatchUp 之后 epoch 递增。任何响应（成功、resync、
+	// cancelled…）都先做代际校验与学习——取消通知本身必须把领导者已知代际推到
+	// 新值，随后晚到的取消前“成功/完成”才会因 epoch 更小而被丢弃，
+	// 不会被静默当成恢复后的进展。新会话的第一个响应负责学习当前代际。
+	if tr.haveEpoch && r.epoch < tr.epoch {
+		n.debugf("drop snapshot response from stale epoch peer=%s respEpoch=%d curEpoch=%d",
+			peer, r.epoch, tr.epoch)
+		return
+	}
+	tr.haveEpoch = true
+	tr.epoch = r.epoch
+	// 跨会话记忆：之后即便压缩换了新会话，也仍然认得对端最新代际。
+	n.knownEpochOK[peer] = true
+	n.knownEpoch[peer] = r.epoch
 
 	if r.success {
 		tr.inflight = false
@@ -221,7 +272,10 @@ func (n *Node) handleSnapshotResponse(peer NodeID, r *installResult) {
 		// 对端可能刚刚 ResumeCatchUp：正常 ACK 立即解除退避。
 		tr.backoff = 0
 		if r.complete {
-			// 整份快照已安装：推进 match/next，交给常规复制补齐剩余日志。
+			// 整份快照已安装：推进 match/next 后，会话记录标记完成并释放字节。
+			// 若领导者在此期间又压缩出了更新的快照（对 peer 而言仍落后），
+			// 不能把会话保留为 done（那会让后续心跳用旧快照点错误地转 AE），
+			// 而要移除会话，由下一轮以最新快照开新会话继续追赶。
 			tr.done = true
 			tr.inflight = false
 			tr.offset = tr.length // 进度视图显示满字节数
@@ -233,10 +287,21 @@ func (n *Node) handleSnapshotResponse(peer NodeID, r *installResult) {
 			n.debugf("peer %s installed snapshot through %d (%d bytes), resume log replication",
 				peer, r.lastIncluded, tr.length)
 			n.advanceCommitIndex()
+			if n.matchIndex[peer] < n.snapMeta.LastIncludedIndex {
+				// 钉住的旧快照已装完，但领导者又有了更新的快照：立刻开新会话，
+				// 不保留 done 记录（否则进度视图与真实状态不符）。
+				n.dropTransfer(peer)
+				n.startSnapshotTransfer(peer)
+				return
+			}
 			n.sendAppendEntries(peer)
 			return
 		}
 		// 已确认到 ackOffset：单调推进发送位置后立即发下一块。
+		// ackOffset 不能超过快照总长（防御异常对端）。
+		if r.ackOffset > tr.length {
+			r.ackOffset = tr.length
+		}
 		if r.ackOffset > tr.offset {
 			tr.offset = r.ackOffset
 		}
@@ -249,28 +314,40 @@ func (n *Node) handleSnapshotResponse(peer NodeID, r *installResult) {
 	tr.elapsed = 0
 	switch r.reason {
 	case RejectResync:
-		// 对端没有可续传的匹配会话（重启/被新快照覆盖/乱序错位）：
-		// 若快照身份仍然有效，从 0 重建对端会话；身份已更新则直接丢弃，
-		// 后续心跳会用新快照创建新会话。
 		if r.lastIncluded == tr.meta.LastIncludedIndex {
-			n.debugf("peer %s requests resync for snapshot %d, restart from offset 0",
-				peer, r.lastIncluded)
+			// 同一快照身份（丢包/乱序/重启后会话丢失，但磁盘上的连续字节还在）：
+			// 直接跳到对端已 durable 的 AckOffset 续传，绝不再从头重发。
+			seek := r.ackOffset
+			if seek > tr.length {
+				seek = tr.length
+			}
+			n.debugf("peer %s resync snapshot %d: seek to ackOffset=%d (keep %d bytes)",
+				peer, r.lastIncluded, seek, seek)
+			tr.offset = seek
+			n.transmitChunk(peer, tr)
+		} else {
+			// 对端的临时快照是另一个身份（例如旧领导留下的半份）：
+			// 丢弃本会话，用当前最新快照从 0 开新会话。
+			n.debugf("peer %s resync for other snapshot %d (mine %d): restart from 0",
+				peer, r.lastIncluded, tr.meta.LastIncludedIndex)
 			n.dropTransfer(peer)
 			n.startSnapshotTransfer(peer)
-		} else {
-			n.dropTransfer(peer)
 		}
 	case RejectTransferFailed:
-		// 对端丢弃了临时快照（校验/落盘失败），稍后整块重发。
-		n.debugf("peer %s snapshot transfer failed (%s), retry", peer, r.reason)
-		n.dropTransfer(peer)
-		n.startSnapshotTransfer(peer)
+		// 对端丢弃了临时快照（校验/落盘失败）：身份不变，从 0 重发本快照。
+		n.debugf("peer %s snapshot transfer failed (%s), restart from 0", peer, r.reason)
+		tr.offset = 0
+		n.transmitChunk(peer, tr)
 	case RejectCancelled:
 		// 用户取消：有限退避。退避结束自动探测；对端若已 ResumeCatchUp，
 		// 首个正常 ACK 会立刻清零退避并全速续传。
+		// 恢复后对端会清空 staging，因此发送位置回到 0。
+		// 关键：保留从 cancelled 响应学到的 epoch——取消前在途的旧代际
+		// “成功/完成”响应晚到时必须因 epoch 更小而被丢弃，不能被静默当成成功。
 		tr.offset = 0
 		tr.backoff = n.cfg.SnapshotRetryTicks * 4
-		n.debugf("peer %s catch-up cancelled, backing off %d ticks", peer, tr.backoff)
+		n.debugf("peer %s catch-up cancelled (epoch=%d), backing off %d ticks",
+			peer, tr.epoch, tr.backoff)
 	case RejectStaleTerm:
 		// 已在开头处理过高任期；同任期不会返回 stale，忽略等下一轮。
 	default:
@@ -328,10 +405,13 @@ func (in *incomingSnapshot) identityMatches(req *InstallSnapshotRequest) bool {
 		checksumEqual(in.meta.Checksum, req.Checksum)
 }
 
+// ack 用当前断点成功应答。注意：TransferID/Attempt/Epoch 必须回传“请求”里的
+// 值（resp 在入口已按 req 初始化），不能回写 staging 元数据里的旧会话 ID——
+// 接收端重启或领导权切换后，本地暂存的 TransferID 可能属于上一世代，
+// 回写它会让新领导者把本应有效的断点 ACK 当成过期响应永久丢弃。
 func (in *incomingSnapshot) ack(resp *InstallSnapshotResponse) {
 	resp.Success = true
 	resp.Chunked = true
-	resp.TransferID = in.meta.TransferID
 	resp.LastIncluded = in.meta.LastIncludedIndex
 	resp.AckOffset = in.received
 }
@@ -349,7 +429,8 @@ func (n *Node) discardIncoming(reason RejectReason) {
 // handleChunkedInstallSnapshot 在事件循环内处理一个分块快照请求。
 func (n *Node) handleChunkedInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapshotResponse {
 	resp := &InstallSnapshotResponse{Term: n.term, Peer: n.cfg.ID, Chunked: true,
-		LastIncluded: req.LastIncludedIndex}
+		LastIncluded: req.LastIncludedIndex, TransferID: req.TransferID,
+		Attempt: req.Attempt, Epoch: n.catchupEpoch}
 
 	// 任期检查与角色让位（与整体快照路径一致）。
 	if req.Term < n.term {
@@ -378,7 +459,6 @@ func (n *Node) handleChunkedInstallSnapshot(req *InstallSnapshotRequest) *Instal
 		resp.Success = true
 		resp.Complete = true
 		resp.AckOffset = req.Length
-		resp.TransferID = req.TransferID
 		return resp
 	}
 
@@ -413,8 +493,13 @@ func (n *Node) handleChunkedInstallSnapshot(req *InstallSnapshotRequest) *Instal
 	case newIdentity && req.Offset != 0:
 		// 身份变了（领导者压缩/本端重启后会话已清），但对方发的不是首块：
 		// 明确要求从 0 重发，绝不拼接不同快照的字节。
+		// LastIncluded/AckOffset 回报本端旧临时快照的断点，供领导者诊断与续传决策。
 		n.debugf("snapshot identity mismatch at offset=%d (want restart at 0)", req.Offset)
 		resp.Reason = RejectResync
+		if in != nil {
+			resp.LastIncluded = in.meta.LastIncludedIndex
+			resp.AckOffset = in.received
+		}
 		return resp
 	case newIdentity:
 		// 全新快照的首块：丢弃旧临时数据，从头开始。
@@ -530,7 +615,6 @@ func (n *Node) handleChunkedInstallSnapshot(req *InstallSnapshotRequest) *Instal
 	resp.Success = true
 	resp.Complete = true
 	resp.AckOffset = in.received
-	resp.TransferID = in.meta.TransferID
 	resp.LastIncluded = meta.LastIncludedIndex
 	return resp
 }
@@ -579,6 +663,8 @@ func (n *Node) snapshotTransfersLocked() map[NodeID]CatchUpProgress {
 // cancelCatchUpLocked 取消本机进行中的接收。临时数据保留（恢复后可继续清理），
 // 但领导者之后的块一律被拒绝，直到 resumeCatchUpLocked。
 func (n *Node) cancelCatchUpLocked() error {
+	n.catchupEpoch++ // 取消/恢复构成新的接收代际（持久化，跨重启仍有效）
+	n.persistState()
 	if n.incoming == nil {
 		// 没有进行中的传输：记录一个取消标记，使紧接着到来的首块也被拒绝。
 		n.incoming = &incomingSnapshot{state: CatchUpCancelled}
@@ -586,18 +672,19 @@ func (n *Node) cancelCatchUpLocked() error {
 	}
 	n.incoming.state = CatchUpCancelled
 	n.incoming.reason = RejectCancelled
-	n.debugf("snapshot catch-up cancelled by user at %d/%d bytes",
-		n.incoming.received, n.incoming.meta.Length)
+	n.debugf("snapshot catch-up cancelled by user at %d/%d bytes (epoch=%d)",
+		n.incoming.received, n.incoming.meta.Length, n.catchupEpoch)
 	return nil
 }
 
-// resumeCatchUpLocked 解除取消：丢弃可能残留的失败/取消会话，让领导者从 0 重新开始；
-// 若磁盘上有匹配的完整临时快照则下次首块后也会快速重建。
+// resumeCatchUpLocked 解除取消：丢弃可能残留的失败/取消会话，让领导者从 0 重新开始。
+// 取消时递增的 epoch 不回退：取消期间发出的旧代际成功响应在领导者侧仍然作废，
+// 不会把“取消前的在途成功”悄悄当成“恢复后的成功”。
 func (n *Node) resumeCatchUpLocked() error {
 	if n.incoming != nil && n.incoming.state == CatchUpCancelled {
 		_ = n.store.ClearStaging()
 		n.incoming = nil
-		n.debugf("snapshot catch-up resumed by user")
+		n.debugf("snapshot catch-up resumed by user (epoch=%d retained)", n.catchupEpoch)
 	}
 	return nil
 }

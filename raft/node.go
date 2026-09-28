@@ -51,9 +51,16 @@ type Node struct {
 	snapXfers map[NodeID]*snapshotTransfer
 	// 下一个分块传输标识。
 	nextTransferID uint64
+	// 已知的各 peer 接收代际（跨快照会话保留）：取消后重开的新会话仍记得
+	// 对端已经递增过的 epoch，旧代际迟到响应无处遁形。
+	knownEpoch   map[NodeID]uint64
+	knownEpochOK map[NodeID]bool
 
 	// 跟随者侧：进行中的分块快照接收状态（仅事件循环访问；nil 表示没有）。
 	incoming *incomingSnapshot
+	// catchupEpoch 接收代际（仅跟随者事件循环访问）：每次 CancelCatchUp 递增；
+	// ResumeCatchUp 后旧代际的迟到“成功”响应在领导者侧仍被作废。
+	catchupEpoch uint64
 
 	// 候选人得票
 	grantedVotes map[NodeID]bool
@@ -91,20 +98,22 @@ func NewNode(cfg Config, tr Transport) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{
-		cfg:        cfg,
-		store:      store,
-		tr:         tr,
-		sm:         NewKVStateMachine(),
-		role:       RoleFollower,
-		nextIndex:  make(map[NodeID]Index),
-		matchIndex: make(map[NodeID]Index),
-		snapXfers:  make(map[NodeID]*snapshotTransfer),
-		proposals:  make(map[Index][]chan clientOutcome),
-		appliedSeq: make(map[string]appliedSeqEntry),
-		events:     make(chan internalEvent, 256),
-		stopCh:     make(chan struct{}),
-		doneCh:     make(chan struct{}),
-		logf:       func(string, ...any) {},
+		cfg:          cfg,
+		store:        store,
+		tr:           tr,
+		sm:           NewKVStateMachine(),
+		role:         RoleFollower,
+		nextIndex:    make(map[NodeID]Index),
+		matchIndex:   make(map[NodeID]Index),
+		snapXfers:    make(map[NodeID]*snapshotTransfer),
+		knownEpoch:   make(map[NodeID]uint64),
+		knownEpochOK: make(map[NodeID]bool),
+		proposals:    make(map[Index][]chan clientOutcome),
+		appliedSeq:   make(map[string]appliedSeqEntry),
+		events:       make(chan internalEvent, 256),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
+		logf:         func(string, ...any) {},
 	}
 	seed := cfg.RandSeed
 	if seed == 0 {
@@ -129,11 +138,11 @@ func (n *Node) SetLogger(f func(format string, args ...any)) {
 
 // restore 从持久化介质恢复硬状态、快照与日志后缀。
 func (n *Node) restore() error {
-	term, voted, err := n.store.LoadState()
+	term, voted, epoch, err := n.store.LoadState()
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
-	n.term, n.votedFor = term, voted
+	n.term, n.votedFor, n.catchupEpoch = term, voted, epoch
 
 	meta, data, err := n.store.LoadSnapshot()
 	if err != nil {
@@ -260,7 +269,7 @@ func (n *Node) Status() Status {
 // ---- 持久化辅助（仅事件循环调用） ----
 
 func (n *Node) persistState() {
-	if err := n.store.SaveState(n.term, n.votedFor); err != nil {
+	if err := n.store.SaveState(n.term, n.votedFor, n.catchupEpoch); err != nil {
 		n.logf("[%s] persist state error: %v", n.cfg.ID, err)
 	}
 }

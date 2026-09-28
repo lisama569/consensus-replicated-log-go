@@ -22,8 +22,9 @@ type SnapshotMeta struct {
 
 // persistedState 是硬状态（currentTerm/votedFor）的磁盘格式。
 type persistedState struct {
-	Term     Term   `json:"term"`
-	VotedFor NodeID `json:"voted_for"`
+	Term         Term   `json:"term"`
+	VotedFor     NodeID `json:"voted_for"`
+	CatchupEpoch uint64 `json:"catchup_epoch,omitempty"` // 快照追赶的接收代际（取消递增，需跨重启保留）
 }
 
 // persistedSnapshot 是快照文件格式：元数据 + 状态机字节（base64）。
@@ -40,12 +41,13 @@ type FileStore struct {
 	dir string
 
 	// 内存模式（dir == ""）下使用的字段。
-	memTerm  Term
-	memVoted NodeID
-	memLog   []LogEntry
-	memSnap  *persistedSnapshot
-	hasState bool
-	hasSnap  bool
+	memTerm         Term
+	memVoted        NodeID
+	memCatchupEpoch uint64
+	memLog          []LogEntry
+	memSnap         *persistedSnapshot
+	hasState        bool
+	hasSnap         bool
 
 	// 内存模式下的临时分块快照。
 	memStaging     *persistedStaging
@@ -69,27 +71,28 @@ func (s *FileStore) Close() error { return nil }
 
 // ---- 硬状态 ----
 
-func (s *FileStore) LoadState() (term Term, votedFor NodeID, err error) {
+func (s *FileStore) LoadState() (term Term, votedFor NodeID, catchupEpoch uint64, err error) {
 	if s.dir == "" {
 		if !s.hasState {
-			return 0, "", nil
+			return 0, "", 0, nil
 		}
-		return s.memTerm, s.memVoted, nil
+		return s.memTerm, s.memVoted, s.memCatchupEpoch, nil
 	}
 	var p persistedState
 	ok, err := readJSON(filepath.Join(s.dir, stateFile), &p)
 	if err != nil || !ok {
-		return 0, "", err
+		return 0, "", 0, err
 	}
-	return p.Term, p.VotedFor, nil
+	return p.Term, p.VotedFor, p.CatchupEpoch, nil
 }
 
-func (s *FileStore) SaveState(term Term, votedFor NodeID) error {
+func (s *FileStore) SaveState(term Term, votedFor NodeID, catchupEpoch uint64) error {
 	if s.dir == "" {
-		s.memTerm, s.memVoted, s.hasState = term, votedFor, true
+		s.memTerm, s.memVoted, s.memCatchupEpoch, s.hasState = term, votedFor, catchupEpoch, true
 		return nil
 	}
-	return writeJSONAtomic(filepath.Join(s.dir, stateFile), &persistedState{Term: term, VotedFor: votedFor})
+	return writeJSONAtomic(filepath.Join(s.dir, stateFile),
+		&persistedState{Term: term, VotedFor: votedFor, CatchupEpoch: catchupEpoch})
 }
 
 // ---- 快照 ----

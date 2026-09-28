@@ -187,7 +187,8 @@ func TestChunkedSnapshotResumeAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	cli := NewClient("restart", nodesOf(c)...)
-	ctx, cancel := context.WithTimeout(context.Background(), waitShort)
+	// -race + 整包高负载下磁盘与调度都会被显著放大，给足初始写入时间。
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	totalWrites := writeBulk(t, cli, ctx, 100)
 	waitFor(t, func() bool {
@@ -724,7 +725,7 @@ func TestUpgradeFromOldSnapshotOnDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta := SnapshotMeta{LastIncludedIndex: 20, LastIncludedTerm: 2}
-	if err := store.SaveState(2, "u2"); err != nil {
+	if err := store.SaveState(2, "u2", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SaveSnapshot(meta, snapData); err != nil {
@@ -910,7 +911,7 @@ func TestStagingClearedWhenSnapshotAlreadyInstalled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SaveState(3, "s2"); err != nil {
+	if err := st.SaveState(3, "s2", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.SaveSnapshot(SnapshotMeta{LastIncludedIndex: 30, LastIncludedTerm: 3}, newData); err != nil {

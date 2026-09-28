@@ -116,15 +116,36 @@ func TestMinorityCannotCommit(t *testing.T) {
 func TestRejectReasons(t *testing.T) {
 	c := newTestCluster(t, 3, false, 303)
 	waitFor(t, func() bool { return c.Leader() != "" }, "leader")
-	leader := c.Node(c.Leader())
-	follower := func() *Node {
+	// 等待所有节点进入同一任期并已知领导者：高负载（-race 整包）下选出瞬间
+	// 可能仍有节点在旧任期且尚未投票，否则同票检查会偶发落到刚起步的节点。
+	waitForDur(t, 5*time.Second, func() bool {
+		leaderID := c.Leader()
+		if leaderID == "" {
+			return false
+		}
+		lt := c.Node(leaderID).Status().Term
 		for _, n := range c.Nodes() {
-			if n.Status().Role != RoleLeader {
-				return n
+			s := n.Status()
+			if s.Term != lt || (s.Role != RoleLeader && s.LeaderID == "") {
+				return false
 			}
 		}
-		return nil
-	}()
+		return true
+	}, "all nodes settle in the leader's term")
+	leader := c.Node(c.Leader())
+	// 必须挑一个“本任期已经投过票”的跟随者（即投票给了现任领导者）；
+	// 若它尚未投票，同任期 RequestVote 本就应该被授予，already_voted 检查不成立。
+	var follower *Node
+	waitForDur(t, 5*time.Second, func() bool {
+		for _, n := range c.Nodes() {
+			s := n.Status()
+			if s.Role != RoleLeader && s.VotedFor != "" && s.VotedFor == c.Leader() {
+				follower = n
+				return true
+			}
+		}
+		return false
+	}, "a follower that voted for the leader exists")
 
 	// 1) 过期任期的 RequestVote -> stale_term。
 	staleVote := &RequestVoteRequest{

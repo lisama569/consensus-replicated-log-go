@@ -150,6 +150,8 @@ func TestNotLeaderReject(t *testing.T) {
 			break
 		}
 	}
+	// 等待该跟随者至少收到一轮心跳、已知领导者（-race + 高负载下首拍可能尚未到达）。
+	waitFor(t, func() bool { return follower.Status().LeaderID != "" }, "follower learns leader")
 	ctx := context.Background()
 	_, err := follower.SubmitProposal(ctx, Command{Op: OpSet, Key: "x", Value: "y"})
 	if !errors.Is(err, ErrNotLeader) {

@@ -120,6 +120,8 @@ func (n *Node) sendSnapshotChunk(peer NodeID, req *InstallSnapshotRequest) {
 			lastIncluded: req.LastIncludedIndex,
 			chunked:      true,
 			transferID:   rpcResp.TransferID,
+			attempt:      rpcResp.Attempt,
+			epoch:        rpcResp.Epoch,
 			ackOffset:    rpcResp.AckOffset,
 			complete:     rpcResp.Complete,
 		}

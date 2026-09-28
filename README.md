@@ -150,21 +150,37 @@ Follower ───────────────▶ Candidate ────
 
 ```
 身份 = (LastIncludedIndex, LastIncludedTerm, Length, SHA-256(整份快照))
-InstallSnapshotRequest{Chunked, TransferID, Offset, Length, Checksum, Data, Done}
-InstallSnapshotResponse{Success, AckOffset, Complete, Reason(resync/transfer_failed/cancelled)}
+InstallSnapshotRequest{Chunked, TransferID, Attempt, Offset, Length, Checksum, Data, Done}
+InstallSnapshotResponse{Success, TransferID, Attempt, Epoch, AckOffset, Complete,
+                        Reason(resync/transfer_failed/cancelled)}
 ```
 
+响应与请求之间有三层**相关性标识**，旧响应永远污染不了新传输：
+
+| 标识 | 作用 |
+| --- | --- |
+| `TransferID` | 会话标识：领导权变化/换快照/取消重开都会换 ID；旧会话的迟到响应被直接丢弃 |
+| `Attempt` | 单块发送序号：超时重传/网络重复导致的迟到或重复响应，与当前在途块 attempt 不符即丢弃 |
+| `Epoch` | 接收代际：跟随者每次 `CancelCatchUp` 递增（随硬状态持久化，跨重启保留）；取消前在途的“成功”即使晚到、或节点重启后，也会因代际过旧被作废 |
+
+- **会话钉住（pinned session）**：一次传输一旦建立就钉住创建时的快照身份。
+  追赶期间领导者持续压缩只会产生更新的快照，而**不会打断进行中的传输**——
+  否则接收端已收字节会在负载持续时反复掉回 0、整份快照从头重传。当前快照
+  安装完成后，下一轮心跳自动用最新快照开新会话；若领导者期间又压缩出新快照，
+  旧会话完成后立即续上新会话，不产生空窗。
 - **断点续传**：跟随者把已连续确认的块 `O_APPEND + fsync` 追加到
   `snapshot.staging.data`，元数据原子写入 `snapshot.staging.json`。
-  丢包/超时/重启后，领导者从跟随者回报的 `AckOffset` 继续，不从头重来。
+  丢包/超时/重启后，领导者从跟随者回报的 `AckOffset` 继续，不从头重来；
+  即使跟随者因重启/换领导而回报 `resync`，只要快照身份相同，领导者也是
+  **seek 到 AckOffset** 而不是丢掉会话从 0 开始。
 - **重复块**：偏移落在已收区间内，幂等 ACK 当前断点，不重复落盘。
 - **乱序/空洞块**：偏移不等于已收长度时拒绝（`resync`），**不缓存、不拼接**，
   避免无限缓冲；领导者据 `AckOffset` 从断点重发。
-- **身份变化**：追赶期间领导者压缩出了更新的快照（末索引/任期/长度/校验和任一不同），
-  跟随者要求从新快照的首块重发，绝不把两份不同快照的字节拼在一起。
+- **身份变化**：跟随者暂存的是另一个身份（例如旧领导留下的半份）时要求从新快照
+  的首块重发，绝不把两份不同快照的字节拼在一起。
 - **原子提升**：只有收齐全部字节且重新读出整文件、SHA-256 校验通过，临时快照才会被
   原子提升为正式快照并恢复状态机；此前**半份数据对读取完全不可见**。
-  校验不符/落盘错误 -> 丢弃整份临时数据、状态 `failed`，领导者自动整块重传。
+  校验不符/落盘错误 -> 丢弃整份临时数据、状态 `failed`，领导者身份不变、从 0 重传。
 
 ### 4A.2 追赶期间的一致性保证
 
@@ -202,11 +218,23 @@ node.ResumeCatchUp() // 解除取消；领导者重发后继续/重新完成
 
 ### 4A.4 异常与取消时的行为
 
+- **传输中断/丢包/超时**：超时（`SnapshotRetryTicks`）与“请求或响应丢失”都会
+  立即重发当前块并递增 `Attempt`；跟随者侧字节只增不减，领导者从确认断点续传，
+  已确认的字节不会重发。
 - **节点崩溃/重启**：临时元数据与数据文件是 fsync 的；重启后恢复断点进度继续接收，
-  但绝不直接安装未完成的临时快照。全部完成后再次重启，从正式快照恢复，状态一致。
-- **取消**：取消只是本机状态位，幂等且可重复；被取消期间领导者收到 `cancelled` 会
-  有限退避重试，不会永久卡死，`ResumeCatchUp` 后首个正常 ACK 立即全速续传。
+  但绝不直接安装未完成的临时快照。跟随者回报的会话 ID 来自领导者请求而非本地旧
+  staging，领导权变化/重启后断点 ACK 不会被新领导者误判为过期。全部完成后再次
+  重启，从正式快照恢复，状态一致。
+- **领导权变化**：新任期重建会话；钉住 + 身份校验保证不同领导、不同快照进度的
+  重发交叉到达也不会拼接字节或虚报完成，最终由快照 + 常规 AppendEntries 收敛。
+- **取消**：取消只是本机状态位，幂等且可重复；取消即递增接收代际 `Epoch`，
+  领导者收到 `cancelled` 会有限退避重试而不是永久卡死；`ResumeCatchUp` 后
+  epoch 不回退，取消前在途的旧代际“成功”不会被悄悄当成恢复后的成功，首个
+  正常 ACK 立即全速续传。
 - **磁盘空间/IO 错误、字节损坏**：进入 `failed`，临时数据被清理，等待自动重传。
+- **追不上/被更新进度顶掉**：钉住语义保证一份快照必然传完（不会被持续压缩无限
+  顶掉）；快照装完后若领导者已有更新快照，自动无缝续上下一份；负载停止后落后
+  节点必然追平所有已提交数据，不会卡在空转。
 
 ### 4A.5 容量与兼容范围
 
@@ -277,6 +305,10 @@ node.ResumeCatchUp() // 解除取消；领导者重发后继续/重新完成
 | `TestChunkedSnapshotDuplicateReorderInterleave` | 重复/乱序/丢块 + 传输期间并发写入与压缩，身份交错后仍收敛且不丢已提交数据 |
 | `TestChunkedSnapshotLeadershipChange` | 追赶期间领导权切换、不同进度重发，最终包含全部已提交数据 |
 | `TestChunkedSnapshotCancelAndResume` | 取消后状态 cancelled、半成品不可见、不虚报就绪；恢复后续传完成 |
+| `TestCatchUpUnderContinuousLoad` | **主验收**：大状态机追赶 + 领导者持续写入/持续压缩 + 链路持续丢包；同身份字节单调不减、未传完的快照不被新快照顶掉，最终全部已提交数据齐全且转为常规复制 |
+| `TestSnapshotTransferResponseCorrelation` | 处理器级确定性验证：旧会话迟到响应/错 attempt 响应被丢弃、同身份 resync 从 AckOffset seek 续传、装完后 AE 不再空转 |
+| `TestCancelResumeEpochInvalidatesStaleSuccess` | 处理器级确定性验证：取消前在途的旧代际“伪完成”在恢复后到达也不会被当成成功 |
+| `TestCatchupEpochSurvivesRestart` | 取消/恢复后崩溃重启：epoch 随硬状态持久化，同一领导者任内重启后仍能正常装完快照 |
 | `TestChunkedSnapshotCorruptionUnit` | 字节损坏触发校验失败、丢弃临时数据、failed 态、首块重传成功 |
 | `TestChunkedSnapshotDuplicateAndGapUnit` | 处理器级：重复块幂等、空洞块 resync 不写入、补齐后安装 |
 | `TestLegacyOneShotSnapshotStillWorks` | 旧版一次性 InstallSnapshot 仍可安装（新旧版本互通） |
@@ -310,10 +342,22 @@ go test ./... -race -count=20
 go run ./cmd/demo
 
 # 4) 只跑可恢复大快照续传相关用例（含中断续传、重启续传、重复/乱序/交错、
-#    取消/恢复、损坏检测、领导权切换、旧版兼容）
-go test ./raft/ -run TestChunkedSnapshot -v
+#    取消/恢复、损坏检测、领导权切换、旧版兼容、持续负载主验收）
+go test ./raft/ -run 'TestChunkedSnapshot|TestCatchUpUnderContinuousLoad|TestSnapshotTransferResponseCorrelation|TestCancelResume' -v
 go test ./raft/ -run 'TestLegacyOneShotSnapshotStillWorks|TestUpgradeFromOldSnapshotOnDisk' -v
 ```
+
+主验收场景 `TestCatchUpUnderContinuousLoad` 复现的正是“负载不停就永远追不平”的
+问题：5 节点中隔离 2 个跟随者，向存活多数派写入大状态机并把压缩阈值调到极小，
+恢复落后节点的同时持续写入、持续压缩，并对它的快照链路持续丢 1/4 的块。
+测试断言（任一违反即失败）：
+
+- 同一份快照 `(SnapshotIdx,Total)` 在 syncing 期间已收字节单调不减；
+- 未传完（`Received<Total`、未 caught_up、状态机未越过该快照点）的快照身份
+  不得被更新的快照顶掉——旧实现下该计数可达数十次（字节一遍遍从 0 重传）；
+- 负载停止后落后节点 commit/apply 必然追平领导者提交点，基础负载与追赶期间
+  的全部写入逐条在状态机中可见；
+- 追上后转常规 AppendEntries 复制并继续跟随新写入；第二个隔离节点回归后同样收敛。
 
 若要手工实验：
 

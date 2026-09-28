@@ -221,7 +221,7 @@ func TestConcurrentReadWriteSnapshot(t *testing.T) {
 	}
 	waitFor(t, func() bool { return c.Leader() != "" }, "leader")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -274,11 +274,22 @@ func TestConcurrentReadWriteSnapshot(t *testing.T) {
 	cancel()
 	wg.Wait()
 
-	// 所有节点的状态机最终一致。-race + 整包高负载下给足收敛时间。
-	leader := c.Node(c.Leader())
-	v, _ := leader.sm.Lookup("w0")
-	waitForDur(t, 8*time.Second, func() bool {
+	// 所有节点的状态机最终一致。-race + 整包高负载下给足收敛时间：
+	// 以领导者提交点为准，要求每个节点 commit/apply 都追平，且状态机值一致
+	// （仅比较某个键值在选举抖动时可能被“旧值恰好相同”掩盖）。
+	waitForDur(t, 15*time.Second, func() bool {
+		leaderID := c.Leader()
+		if leaderID == "" {
+			return false
+		}
+		leader := c.Node(leaderID)
+		leaderCommit := leader.Status().CommitIndex
+		v, _ := leader.sm.Lookup("w0")
 		for _, n := range c.Nodes() {
+			s := n.Status()
+			if s.CommitIndex < leaderCommit || s.AppliedIndex < s.CommitIndex {
+				return false
+			}
 			if got, _ := n.sm.Lookup("w0"); got != v {
 				return false
 			}

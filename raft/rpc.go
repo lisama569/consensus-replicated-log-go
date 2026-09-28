@@ -53,6 +53,7 @@ type InstallSnapshotRequest struct {
 	// ---- 分块续传字段（Chunked=false 时全部为零值，走旧版整体安装路径） ----
 	Chunked    bool   // 是否为分块快照请求
 	TransferID uint64 // 本次传输的标识（同一 leader 任期内单调）
+	Attempt    uint64 // 本块的第几次发送（首传=1，超时/重发递增），用于响应相关性判定
 	Offset     uint64 // Data 在完整快照中的字节偏移
 	Length     uint64 // 完整快照的字节总长
 	Checksum   []byte // 完整快照的 SHA-256，每个分块都携带
@@ -68,6 +69,8 @@ type InstallSnapshotResponse struct {
 	// ---- 分块续传字段 ----
 	Chunked      bool
 	TransferID   uint64
+	Attempt      uint64 // 与请求一致的发送序号，供发送方丢弃过期/重复响应
+	Epoch        uint64 // 接收端“接收代际”：每次 CancelCatchUp 递增；恢复后旧代际响应作废
 	LastIncluded Index  // 响应对应快照的末索引（会话相关性判定）
 	AckOffset    uint64 // 已确认连续落盘的字节数（下一块期望偏移）
 	Complete     bool   // 整份快照是否已安装完成
@@ -102,6 +105,8 @@ type installResult struct {
 	lastIncluded Index
 	chunked      bool
 	transferID   uint64
+	attempt      uint64
+	epoch        uint64
 	ackOffset    uint64
 	complete     bool
 }
