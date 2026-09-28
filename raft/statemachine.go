@@ -72,6 +72,10 @@ func (sm *KVStateMachine) Lookup(key string) (string, bool) {
 func (sm *KVStateMachine) Snapshot() ([]byte, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	return sm.marshalLocked()
+}
+
+func (sm *KVStateMachine) marshalLocked() ([]byte, error) {
 	data := snapshotData{
 		KV:      make(map[string]string, len(sm.kv)),
 		LastSeq: make(map[string]uint64, len(sm.lastSeq)),

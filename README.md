@@ -40,15 +40,15 @@ go test ./raft/ -run TestSnapshotCatchUp -v
 | `raft/config.go` | 可配置项与默认值、校验 |
 | `raft/node.go` | 节点生命周期、持久化恢复、客户端通道、串行事件循环骨架 |
 | `raft/eventloop.go` | 时钟 tick、事件分发、角色转换（Follower/Candidate/Leader）、RPC 入口 |
-| `raft/election.go` | 选举：拉票、投票判定、得票统计、更高任期让位 |
-| `raft/replication.go` | AppendEntries 收发、冲突快速回退、多数派提交、状态机应用、读屏障 |
-| `raft/log.go` | 日志布局（快照占位项 + 后缀）、索引换算与修改器 |
-| `raft/snapshot.go` | 压缩（takeSnapshot）、快照安装（commitSnapshotInstall）、旧版整体安装兼容、快照分块发送 |
-| `raft/snapshot_transfer.go` | 可恢复大快照：领导者分块发送会话、跟随者分块接收/校验/提升、进度视图、取消/恢复 API |
-| `raft/staging_store.go` | 接收端临时快照（staging）的原子元数据与分块追加落盘（fsync），崩溃后续传 |
-| `raft/statemachine.go` | KV 状态机：幂等 Apply、Lookup、JSON 快照/恢复 |
-| `raft/store.go` | 持久化：硬状态、日志后缀、快照；原子写（tmp+fsync+rename） |
-| `raft/transport.go` | `MemoryTransport`：同步模拟网络，支持丢包/重复/乱序/分区 |
+| `raft/election.go` | 选举：Pre-Vote 预投票、拉票、投票判定、得票统计、更高任期让位 |
+| `raft/replication.go` | AppendEntries 收发（停等窗口/强制心跳）、冲突快速回退、全条目对账、多数派提交、状态机应用、读屏障 |
+| `raft/log.go` | 日志布局（快照占位项 + 后缀）、索引换算与修改器、按 tick 合并后台落盘 |
+| `raft/snapshot.go` | 压缩（takeSnapshot）、快照单调安全安装、旧版整体安装兼容、快照分块发送 |
+| `raft/snapshot_transfer.go` | 可恢复大快照：滑动窗口发送会话（钉住快照）、跟随者乱序缓存/校验/异步落盘/提升、后台 store worker、进度视图、取消/恢复 API |
+| `raft/staging_store.go` | 接收端临时快照（staging）的原子元数据与分块追加落盘（fsync+读写锁），崩溃后续传 |
+| `raft/statemachine.go` | KV 状态机：幂等 Apply、Lookup、JSON 快照/恢复（RWMutex） |
+| `raft/store.go` | 持久化：硬状态、日志后缀、快照；原子写（tmp+fsync+rename）；读写锁串行化磁盘访问 |
+| `raft/transport.go` | `MemoryTransport`：模拟网络，支持丢包/重复/乱序/延迟/分区，处理器代次防挂死 |
 | `raft/client.go` | 去重客户端：ClientID+单调 Seq、自动找主/重试/轮询 |
 | `raft/cluster.go` | 测试/demo 集群床：崩溃（保留磁盘）、重启、分区、故障注入 |
 | `raft/*_test.go` | 分区、崩溃重启、重复/乱序、快照追赶、并发访问等场景测试 |
@@ -154,17 +154,24 @@ InstallSnapshotRequest{Chunked, TransferID, Offset, Length, Checksum, Data, Done
 InstallSnapshotResponse{Success, AckOffset, Complete, Reason(resync/transfer_failed/cancelled)}
 ```
 
-- **断点续传**：跟随者把已连续确认的块 `O_APPEND + fsync` 追加到
-  `snapshot.staging.data`，元数据原子写入 `snapshot.staging.json`。
-  丢包/超时/重启后，领导者从跟随者回报的 `AckOffset` 继续，不从头重来。
+- **断点续传（滑动窗口）**：领导者对每份快照维护一个有界滑动发送窗口
+  （默认 `snapshotWindow=8` 块），块在途即可继续发送，不必逐块停等。跟随者把
+  连续块 `O_APPEND + fsync` 追加到 `snapshot.staging.data`，元数据原子写入
+  `snapshot.staging.json`；丢包/超时/重启后领导者据跟随者回报的连续 durable
+  断点 `AckOffset` 推进窗口并补齐缺失块，绝不从头重来。
 - **重复块**：偏移落在已收区间内，幂等 ACK 当前断点，不重复落盘。
-- **乱序/空洞块**：偏移不等于已收长度时拒绝（`resync`），**不缓存、不拼接**，
-  避免无限缓冲；领导者据 `AckOffset` 从断点重发。
-- **身份变化**：追赶期间领导者压缩出了更新的快照（末索引/任期/长度/校验和任一不同），
-  跟随者要求从新快照的首块重发，绝不把两份不同快照的字节拼在一起。
+- **乱序/空洞块**：滑动窗口内（最多 `snapshotWindow` 个块）的小块进入有界
+  乱序缓存，空洞补齐后按序落盘；超出窗口或出现真正分叉则回报 `resync`，
+  绝不无界缓存、绝不拼接两份不同快照。
+- **身份变化**：领导者**钉住（pin）**正在发送的那份快照——即使追赶期间它又压出
+  了更新的快照，也先把当前这份完整传完、跟随者装完后再开新会话，从根本上避免
+  「负载不停 → 会话不断作废 → 字节反复掉回 0 → 永远追不平」。
+  跟随者侧身份不同（末索引/任期/长度/校验和任一变化）则要求从新快照首块重发。
 - **原子提升**：只有收齐全部字节且重新读出整文件、SHA-256 校验通过，临时快照才会被
   原子提升为正式快照并恢复状态机；此前**半份数据对读取完全不可见**。
-  校验不符/落盘错误 -> 丢弃整份临时数据、状态 `failed`，领导者自动整块重传。
+  校验不符/落盘错误 -> 丢弃整份临时数据、状态 `failed`，领导者自动重传。
+- **状态机单调不回退**：安装快照是「只前推」操作；领导权切换后若收到不新于本地
+  已应用位置的旧快照，只前移快照/日志边界、绝不 `Restore` 旧字节，已提交数据不丢。
 
 ### 4A.2 追赶期间的一致性保证
 
@@ -234,8 +241,12 @@ node.ResumeCatchUp() // 解除取消；领导者重发后继续/重新完成
 | `ElectionMin` / `ElectionMax` | 10 / 20 ticks | 随机化选举超时范围，避免分票活锁 |
 | `SnapshotThreshold` | 50 | 快照之后增量日志达到该条数即压缩 |
 | `SnapshotChunkSize` | 64KiB | 大快照分块传输的每块字节数 |
-| `SnapshotRetryTicks` | 5 ticks | 未收到块确认时重发当前块的间隔（tick 数） |
+| `SnapshotRetryTicks` | 2 ticks (20ms) | 未收到块确认时重发缺失/在途块的间隔（tick 数） |
+| `SnapshotMinGapTicks` | 0（不节流） | 两次压缩之间的最小 tick 间隔；持续高频小写入+大状态机时可调大以限制压缩 CPU |
 | `RandSeed` | 0=时间随机 | 固定种子可让选主/抖动序列**可复现** |
+
+发送侧固定使用 `snapshotWindow=8` 的滑动窗口（块数，非字节），接收侧用同样大小的
+有界乱序缓存；二者配合让丢包/乱序只重传缺失块而不是整份快照。
 
 客户端侧（`raft/client.go`）：重试间隔 5ms、单次尝试超时 100ms；
 同一逻辑请求在所有重试中保持相同 `(ClientID, Seq)`。
@@ -243,8 +254,43 @@ node.ResumeCatchUp() // 解除取消；领导者重发后继续/重新完成
 模拟网络（`raft/transport.go` 的 `FaultPolicy`）：
 
 - `DropRate`：按概率丢弃请求；`Duplicate`：请求送达两次；`Reorder`：注入随机延迟造成乱序；
+- 新增 `Delay`：可在发送前注入额外延迟（模拟慢链路），与 `DropRate/Reorder/Duplicate` 可叠加；
 - `SetPartition(id,true)`：对某节点双向 blackhole；
 - `MemoryTransport.Seed(seed)`：固定故障随机源。
+
+---
+
+## 5. 非阻塞磁盘 I/O 与事件循环
+
+原始实现里每条日志追加、每次压缩都在 Raft 事件循环线程内同步执行多次 fsync
+（tmp+fsync+rename+目录 fsync）。在真实慢盘上，一次 fsync 可能数毫秒，持续写入 +
+压缩 + 大快照追赶时，事件循环会被 fsync 占满，导致：心跳/投票处理被饿死、追赶中的
+跟随者反复选举超时、快照块收发停滞。新架构把磁盘 I/O 移出事件循环，同时保持
+「所有可变状态只在事件循环上修改」的并发模型：
+
+- **控制面 / 数据面双队列事件循环**：快照数据块 RPC 走独立的高优先 `chunkEvents`
+  队列，心跳/投票/客户端请求等控制消息走低优先 `events` 队列；事件循环每轮优先排空
+  控制面，再批量处理数据块。这样即使大量块在途，心跳与选举也不会被饿死。
+- **每个节点两个串行落盘 worker**：
+  - `chunkJobs`（高优先）：仅处理接收快照的 staging 文件
+    （reset/append-fsync/finalize-verify/clear），保证慢盘上追赶不被普通落盘拖死；
+  - `persistJobs`（低优先）：处理正式快照落盘、日志后缀重写，以及停止前的刷盘屏障。
+  - 两类资源（staging 文件 vs 正式 snapshot/log）互不相交，因此两条队列无需跨序；
+    正式快照「快照字节 + 日志后缀」在同一 worker 内严格先快照后日志地串行完成，
+    并由 `formalWriteMu` 保护，发送方读快照在同一把读锁上，读不到两步之间的中间态。
+- **协议判定留在事件循环，fsync 留在 worker**：接收方对每个块先在事件循环内完成
+  校验/去重/窗口管理，只把磁盘追加交给 worker；ACK 的连续断点是「已 fsync」的位置。
+  worker 完成事件再回到事件循环提交，状态修改因此仍然串行无锁。
+- **日志按 tick 合并落盘**：高频写入时把「每条日志一次整文件重写+fsync」降为
+  「每心跳最多一次」（`logDirty` 标记），避免写放大打爆 worker 反过来卡住循环。
+- **Pre-Vote**：追赶中的落后节点用预投票探测多数派，日志明显追不上时不会先递增
+  任期、不会用虚假高任期扰动在任领导者（详见 §4A 与 `election.go`）。
+- **AppendEntries 停等窗口 + 强制心跳**：每条普通 AE 在途时不重复洪泛（
+  `aeInflight`），但每个 tick 的心跳强制发送，使窗口在丢包/领导权切换后能自愈，
+  不会因一个丢失的在途标记把某个 peer 永久卡住。
+- **崩溃安全刷盘**：`Stop()`（测试中的模拟崩溃）先经事件循环投递屏障任务，等待
+  此前所有已提交日志/快照 fsync 完成后再关闭；重启时若发现「新快照 + 尚未重写的
+  旧后缀」这种崩溃窗口残留，会丢弃已被快照覆盖的旧后缀而不是报错。
 
 ---
 
@@ -272,13 +318,16 @@ node.ResumeCatchUp() // 解除取消；领导者重发后继续/重新完成
 | `TestDuplicateAndReorderDelivery` | 重复+乱序网络下结果唯一、日志无重复索引 |
 | `TestSnapshotCompactionAndRestart` | 压缩后重启，状态机/提交/应用位置一致 |
 | `TestSnapshotCatchUp` | 长期离线节点经 InstallSnapshot（分块路径）追上并继续复制 |
-| `TestChunkedSnapshotResumeAfterDrops` | 大快照丢块后从断点续传（不从头），字节进度与发送侧视图可查询 |
+| `TestChunkedSnapshotResumeAfterDrops` | 大快照丢块后滑动窗口续传（不从头），字节进度与发送侧视图可查询 |
 | `TestChunkedSnapshotResumeAcrossRestart` | 传一半节点崩溃重启，临时快照续传；完成后再重启仍一致 |
 | `TestChunkedSnapshotDuplicateReorderInterleave` | 重复/乱序/丢块 + 传输期间并发写入与压缩，身份交错后仍收敛且不丢已提交数据 |
-| `TestChunkedSnapshotLeadershipChange` | 追赶期间领导权切换、不同进度重发，最终包含全部已提交数据 |
-| `TestChunkedSnapshotCancelAndResume` | 取消后状态 cancelled、半成品不可见、不虚报就绪；恢复后续传完成 |
+| `TestChunkedSnapshotLeadershipChange` | 追赶期间领导权切换、健康节点选新主、不同进度重发，最终包含全部已提交数据 |
+| `TestChunkedSnapshotCancelAndResume` | 慢盘落盘下取消：cancelled 态、半成品不可见、不虚报就绪；恢复后续传完成 |
 | `TestChunkedSnapshotCorruptionUnit` | 字节损坏触发校验失败、丢弃临时数据、failed 态、首块重传成功 |
-| `TestChunkedSnapshotDuplicateAndGapUnit` | 处理器级：重复块幂等、空洞块 resync 不写入、补齐后安装 |
+| `TestChunkedSnapshotDuplicateAndGapUnit` | 处理器级：重复块幂等、窗口内乱序缓存、超窗空洞 resync、补齐后安装 |
+| `TestChunkedSnapshotCatchUpUnderContinuousLoad` | **大状态机 + 持续写入压缩 + 持续概率丢块 + 慢盘 fsync**：负载期间连续装完多份前进快照，停写后追平且全部已提交数据齐全（核心回归） |
+| `TestChunkedSnapshotStagingBytesMonotonicPerIdentity` | 持续丢块/压缩/重启下，同一会话身份内已 fsync 字节只增不减（禁止字节回 0） |
+| `TestChunkedSnapshotCatchUpDropTimeoutAndRestart` | 多轮「收到部分块→崩溃→重启」，已确认断点保留、最终追平 |
 | `TestLegacyOneShotSnapshotStillWorks` | 旧版一次性 InstallSnapshot 仍可安装（新旧版本互通） |
 | `TestUpgradeFromOldSnapshotOnDisk` | 磁盘只有旧格式快照时新版本正常恢复，无需清库 |
 | `TestConcurrentReadWriteSnapshot` | 并发读写+压缩（`-race`）无数据竞争，最终一致 |
@@ -310,7 +359,7 @@ go test ./... -race -count=20
 go run ./cmd/demo
 
 # 4) 只跑可恢复大快照续传相关用例（含中断续传、重启续传、重复/乱序/交错、
-#    取消/恢复、损坏检测、领导权切换、旧版兼容）
+#    取消/恢复、损坏检测、领导权切换、旧版兼容、持续负载压力）
 go test ./raft/ -run TestChunkedSnapshot -v
 go test ./raft/ -run 'TestLegacyOneShotSnapshotStillWorks|TestUpgradeFromOldSnapshotOnDisk' -v
 ```
@@ -321,19 +370,27 @@ go test ./raft/ -run 'TestLegacyOneShotSnapshotStillWorks|TestUpgradeFromOldSnap
 c, _ := raft.NewCluster(5, true /*持久化*/, 1234)
 defer c.Stop()
 // <- 等待 c.Leader()
-c.SetSnapshotChunkSizeAll(64) // 调小分块，便于在小状态机上观察多块续传
+c.SetSnapshotChunkSizeAll(64) // 调小分块，便于在小状态机上观察多块/窗口续传
 cli := raft.NewClient("my-client", /*nodes...*/)
 cli.Set(ctx, "k", "v")                 // 多数派提交后返回
 c.Isolate(c.Leader())                  // 制造分区
 c.Flaky("n1", "n2", raft.RPCAppendEntries, raft.FaultPolicy{DropRate: 0.5, Duplicate: true})
 
-// 对快照分块注入确定性故障（丢块/改字节），复现断点续传与校验失败：
+// 对快照分块注入确定性故障（丢块/慢链路），复现窗口重传与断点续传：
 c.SetSnapshotHook(&raft.SnapshotFaultHook{
     Drop: func(from, to raft.NodeID, req *raft.InstallSnapshotRequest) bool {
-        return req.Chunked && req.Offset > 0 /* 丢掉首块之后的块，观察 AckOffset 续传 */
+        return req.Chunked && req.Offset > 0 // 丢块，观察滑动窗口据 AckOffset 补齐
     },
+    // Delay: func(...) time.Duration { return 30 * time.Millisecond }, // 模拟慢链路
 })
+// 模拟落后节点的慢盘 fsync（验证 fsync 不阻塞心跳/选举，追赶仍能推进）：
+node.SetChunkIODelay(3 * time.Millisecond)
 // ... 恢复：c.Heal(id) / c.HealAll() / c.SetSnapshotHook(nil)
 // 查询追赶进度：node.CatchUpProgress()，或 node.CancelCatchUp()/ResumeCatchUp()
 ```
+
+> 提示：追赶类压力测试在 `-race` 下会因 fsync/调度变慢而使用 race 感知的更宽松
+> 超时（测试内部 `wd()/writerPace()` 自动放大），手工复现慢盘+持续写入时建议同样
+> 给写入加节流（如每 4~8ms 一条），使快照推进不超过链路可追平的速度——这是任何
+> 复制协议在「写入无限快、带宽/磁盘有限」下都成立的物理前提，而非协议缺陷。
 

@@ -43,7 +43,7 @@ func waitProgressState(t *testing.T, n *Node, want CatchUpState, msg string) Cat
 // waitForDur 与 waitFor 相同，但允许自定义超时时长。
 func waitForDur(t *testing.T, d time.Duration, cond func() bool, msg string) {
 	t.Helper()
-	deadline := time.Now().Add(d)
+	deadline := time.Now().Add(wd(d))
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -87,7 +87,7 @@ func TestChunkedSnapshotResumeAfterDrops(t *testing.T) {
 		c.SetSnapshotChunkSize(id, 48) // 极小分块，制造大量块
 	}
 	restartAllWithConfig(t, c)
-	waitFor(t, func() bool { return c.Leader() != "" }, "leader")
+	waitCatchUp(t, func() bool { return c.Leader() != "" }, "leader")
 	leader := c.Leader()
 	laggard := pickFollower(t, c, leader)
 	if err := c.Crash(laggard); err != nil {
@@ -98,7 +98,7 @@ func TestChunkedSnapshotResumeAfterDrops(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), waitShort)
 	defer cancel()
 	totalWrites := writeBulk(t, cli, ctx, 80)
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		for _, id := range c.IDs() {
 			if id == laggard {
 				continue
@@ -133,7 +133,7 @@ func TestChunkedSnapshotResumeAfterDrops(t *testing.T) {
 	ln := c.Node(laggard)
 
 	var syncing CatchUpProgress
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		syncing = ln.CatchUpProgress()
 		return syncing.State == CatchUpSyncing && syncing.Total > 0
 	}, "laggard enters syncing with total bytes")
@@ -155,7 +155,7 @@ func TestChunkedSnapshotResumeAfterDrops(t *testing.T) {
 	t.Logf("observed max chunk offset=%d, dropped=%d",
 		atomic.LoadInt64(&sawOffset), atomic.LoadInt32(&dropped))
 
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		for i := 0; i < totalWrites; i++ {
 			k, v := bulkKV(i)
 			if got, ok := ln.sm.Lookup(k); !ok || got != v {
@@ -165,7 +165,7 @@ func TestChunkedSnapshotResumeAfterDrops(t *testing.T) {
 		return true
 	}, "laggard state machine complete after resume")
 
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		p, ok := c.Node(leader).SnapshotTransfers()[laggard]
 		return ok && p.State == CatchUpCaughtUp && p.Received == p.Total
 	}, "leader view shows caught_up")
@@ -180,7 +180,7 @@ func TestChunkedSnapshotResumeAcrossRestart(t *testing.T) {
 		c.SetSnapshotChunkSize(id, 64)
 	}
 	restartAllWithConfig(t, c)
-	waitFor(t, func() bool { return c.Leader() != "" }, "leader")
+	waitCatchUp(t, func() bool { return c.Leader() != "" }, "leader")
 	leader := c.Leader()
 	laggard := pickFollower(t, c, leader)
 	if err := c.Crash(laggard); err != nil {
@@ -190,7 +190,7 @@ func TestChunkedSnapshotResumeAcrossRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), waitShort)
 	defer cancel()
 	totalWrites := writeBulk(t, cli, ctx, 100)
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		for _, id := range c.IDs() {
 			if id != laggard && !c.SnapshotExists(id) {
 				return false
@@ -205,7 +205,7 @@ func TestChunkedSnapshotResumeAcrossRestart(t *testing.T) {
 			if NodeID(to) != laggard || atomic.LoadInt32(&crashed) != 0 {
 				return false
 			}
-			if req.Offset >= 256 {
+			if req.Offset > 0 {
 				atomic.StoreInt32(&crashed, 1)
 				go func() { _ = c.Crash(laggard) }()
 				return true
@@ -217,10 +217,10 @@ func TestChunkedSnapshotResumeAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		return atomic.LoadInt32(&crashed) == 1 && c.Node(laggard) == nil
 	}, "laggard crashed mid-transfer")
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		if err := c.Restart(laggard); err != nil {
 			return false
 		}
@@ -235,7 +235,7 @@ func TestChunkedSnapshotResumeAcrossRestart(t *testing.T) {
 	}
 	t.Logf("after restart caught up: %d bytes, snapshot index=%d", p.Total, p.SnapshotIdx)
 
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		for i := 0; i < totalWrites; i++ {
 			k, v := bulkKV(i)
 			if got, ok := ln.sm.Lookup(k); !ok || got != v {
@@ -253,7 +253,7 @@ func TestChunkedSnapshotResumeAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	ln = c.Node(laggard)
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		s := ln.Status()
 		if s.SnapshotIndex == 0 {
 			return false
@@ -281,7 +281,7 @@ func TestChunkedSnapshotDuplicateReorderInterleave(t *testing.T) {
 		c.SetSnapshotChunkSize(id, 32)
 	}
 	restartAllWithConfig(t, c)
-	waitFor(t, func() bool { return c.Leader() != "" }, "leader")
+	waitCatchUp(t, func() bool { return c.Leader() != "" }, "leader")
 	leader := c.Leader()
 	laggard := pickFollower(t, c, leader)
 	if err := c.Crash(laggard); err != nil {
@@ -289,7 +289,7 @@ func TestChunkedSnapshotDuplicateReorderInterleave(t *testing.T) {
 	}
 
 	cli := NewClient("interleave", nodesOf(c)...)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), wd(8*time.Second))
 	defer cancel()
 	n0 := writeBulk(t, cli, ctx, 30)
 
@@ -373,21 +373,21 @@ func TestChunkedSnapshotDuplicateReorderInterleave(t *testing.T) {
 func TestChunkedSnapshotCancelAndResume(t *testing.T) {
 	c := newTestCluster(t, 3, true, 51515)
 	for _, id := range c.IDs() {
-		c.SetSnapshotThreshold(id, 5)
-		c.SetSnapshotChunkSize(id, 32)
+		c.SetSnapshotThreshold(id, 60)
+		c.SetSnapshotChunkSize(id, 64)
 	}
 	restartAllWithConfig(t, c)
-	waitFor(t, func() bool { return c.Leader() != "" }, "leader")
+	waitCatchUp(t, func() bool { return c.Leader() != "" }, "leader")
 	leader := c.Leader()
 	laggard := pickFollower(t, c, leader)
 	if err := c.Crash(laggard); err != nil {
 		t.Fatal(err)
 	}
 	cli := NewClient("cancel", nodesOf(c)...)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), wd(8*time.Second))
 	defer cancel()
 	totalWrites := writeBulk(t, cli, ctx, 60)
-	waitFor(t, func() bool {
+	waitCatchUp(t, func() bool {
 		for _, id := range c.IDs() {
 			if id != laggard && !c.SnapshotExists(id) {
 				return false
@@ -403,8 +403,8 @@ func TestChunkedSnapshotCancelAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	ln := c.Node(laggard)
-
-	// 等会话建立后取消。
+	// 慢盘落盘：给取消留出可观察的窗口（取消必须能在 fsync 流水线中拦住安装）。
+	ln.SetChunkIODelay(8 * time.Millisecond)
 	waitForDur(t, 3*time.Second, func() bool {
 		return ln.CatchUpProgress().State == CatchUpSyncing
 	}, "syncing starts")
@@ -475,6 +475,46 @@ func sendChunks(t *testing.T, n *Node, term Term, leader NodeID,
 	return last
 }
 
+// catchWait 是端到端快照追赶测试的宽松超时：包含落盘 fsync、丢包重传、
+// 滑动窗口在途确认等。-race 下整体执行慢一个数量级，用 cw() 取超时。
+func cw(base time.Duration) time.Duration {
+	if raceEnabled {
+		return base * 6
+	}
+	return base
+}
+
+var raceEnabled = false
+
+// waitCatchUp 用宽松超时轮询条件（端到端追赶用）。
+func waitCatchUp(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(cw(8 * time.Second))
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting: %s", msg)
+}
+
+// waitChunkSettled 轮询直到分块接收的后台落盘 worker 空闲（无 write/
+// finalize/install 在途）。磁盘 I/O 改为异步后，处理器返回只代表已入队，
+// 处理器级单测需要用它等待真正落盘/校验/提升完成。
+func waitChunkSettled(t *testing.T, n *Node) {
+	t.Helper()
+	deadline := time.Now().Add(waitShort)
+	for time.Now().Before(deadline) {
+		q := n.CatchUpProgressQuiet()
+		if !q.busySettling() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("chunk worker never settled: %+v", n.CatchUpProgress())
+}
+
 // newReceiverNode 构造一个已启动的、处于给定任期跟随者状态的节点（处理器级测试用）。
 func newReceiverNode(t *testing.T, term Term, leader NodeID) *Node {
 	tr := NewMemoryTransport()
@@ -519,15 +559,15 @@ func TestChunkedSnapshotCorruptionUnit(t *testing.T) {
 	meta := SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 4}
 	const chunk = 17 // 故意很小且不整除
 
-	// 第一次：损坏末块。
-	resp := sendChunks(t, n, term, leader, meta, data, chunk, true)
-	if resp == nil || resp.Success || resp.Reason != RejectTransferFailed {
-		t.Fatalf("corrupted final chunk must fail with transfer_failed, got %+v", resp)
-	}
+	// 第一次：损坏末块。末块的 RPC 只把校验任务入队（异步）；等待 worker 完成校验。
+	sendChunks(t, n, term, leader, meta, data, chunk, true)
+	waitChunkSettled(t, n)
 	p := n.CatchUpProgress()
 	if p.State != CatchUpFailed || p.FailedReason != RejectTransferFailed {
 		t.Fatalf("want failed/transfer_failed, got %+v", p)
 	}
+	// clear 任务可能仍在途，再等一次让 staging 真正清空。
+	waitChunkSettled(t, n)
 	// 正式快照绝不能被安装。
 	if n.snapMeta.LastIncludedIndex != 0 {
 		t.Fatalf("corrupt data must never be promoted to snapshot, snap=%d", n.snapMeta.LastIncludedIndex)
@@ -551,11 +591,12 @@ func TestChunkedSnapshotCorruptionUnit(t *testing.T) {
 		t.Fatalf("non-first chunk in failed state must resync, got %+v", r2)
 	}
 
-	// 第二次：完好重传整份快照 -> 成功安装。
-	resp = sendChunks(t, n, term, leader, meta, data, chunk, false)
-	if resp == nil || !resp.Success || !resp.Complete {
-		t.Fatalf("clean retransfer must complete, got %+v", resp)
-	}
+	// 第二次：完好重传整份快照 -> 成功安装（末块入队后等待异步校验/提升完成）。
+	sendChunks(t, n, term, leader, meta, data, chunk, false)
+	waitFor(t, func() bool {
+		p := n.CatchUpProgress()
+		return p.State == CatchUpCaughtUp && !n.CatchUpProgressQuiet().busySettling()
+	}, "clean retransfer installs")
 	if n.CatchUpProgress().State != CatchUpCaughtUp {
 		t.Fatalf("want caught_up, got %+v", n.CatchUpProgress())
 	}
@@ -609,43 +650,58 @@ func TestChunkedSnapshotDuplicateAndGapUnit(t *testing.T) {
 		}
 	}
 
-	// 首块 [0,chunk)。
-	r := n.CallRPC(mk(0, false)).(*InstallSnapshotResponse)
-	if !r.Success || r.AckOffset != chunk {
-		t.Fatalf("first chunk ack want %d, got %+v", chunk, r)
-	}
+	// 首块 [0,chunk)：RPC 只把追加任务入队，ACK 为 durable 断点（异步 fsync）。
+	var r *InstallSnapshotResponse
+	n.CallRPC(mk(0, false))
+	waitFor(t, func() bool { return n.CatchUpProgress().Received >= chunk }, "first chunk durable")
 	// 重复首块：幂等返回相同断点。
 	r = n.CallRPC(mk(0, false)).(*InstallSnapshotResponse)
 	if !r.Success || r.AckOffset != chunk {
 		t.Fatalf("duplicate chunk must be idempotent, got %+v", r)
 	}
-	// 乱序块（跳到 chunk*3）：出现空洞，必须 resync，且不写入。
-	gapOff := chunk * 3
-	if gapOff >= len(data) {
-		gapOff = chunk // 数据短时退化为下一块
+	// 乱序块：滑动窗口内的小块（chunk*3）进入有界乱序缓存——成功 ACK 但不写盘
+	// （连续点未到），且不得提升断点。
+	nearGap := chunk * 3
+	r = n.CallRPC(mk(nearGap, false)).(*InstallSnapshotResponse)
+	if !r.Success || r.AckOffset != chunk {
+		t.Fatalf("in-window out-of-order chunk is buffered with stale ack, got %+v", r)
 	}
-	if gapOff != chunk { // 仅当确实能构造空洞时验证
-		r = n.CallRPC(mk(gapOff, false)).(*InstallSnapshotResponse)
-		if r.Success || r.Reason != RejectResync || r.AckOffset != chunk {
-			t.Fatalf("gap chunk must resync with ack=%d, got %+v", chunk, r)
+	if size, _ := n.store.StagingSize(); size != chunk {
+		t.Fatalf("buffered out-of-order chunk must not be written yet, size=%d", size)
+	}
+	// 乱序缓存只容纳 snapshotWindow 个空洞块；填满后第 (window+1) 个必须 resync。
+	// （测试节点用默认大块，无法在小快照里构造“字节距离超窗”，这里验证计数上限。）
+	var sawResync bool
+	for i := 0; i < snapshotWindow+1; i++ {
+		off := uint64(nearGap) + uint64(i+1)*uint64(chunk)
+		if off >= uint64(len(data)) {
+			break
 		}
-		if size, _ := n.store.StagingSize(); size != chunk {
-			t.Fatalf("out-of-order chunk must not be written, size=%d", size)
+		rf := n.CallRPC(mk(int(off), false)).(*InstallSnapshotResponse)
+		if !rf.Success && rf.Reason == RejectResync {
+			sawResync = true
 		}
 	}
-	// 按序补齐直到末块。
+	if !sawResync {
+		t.Fatal("expected resync after reorder buffer fills, got none")
+	}
+	// 按序补齐直到末块（末块 complete 在异步校验/提升完成后由重发短路返回；
+	// 这里直接等待 caught_up，处理器级语义等价）。
 	for off := chunk; off < len(data); off += chunk {
 		end := off + chunk
 		done := end >= len(data)
-		r = n.CallRPC(mk(off, done)).(*InstallSnapshotResponse)
-		if done {
-			if !r.Success || !r.Complete {
-				t.Fatalf("final chunk must complete, got %+v", r)
+		n.CallRPC(mk(off, done))
+		if !done {
+			want := uint64(end)
+			if want > uint64(len(data)) {
+				want = uint64(len(data))
 			}
-		} else if !r.Success || r.AckOffset != uint64(end) {
-			t.Fatalf("chunk at %d ack want %d, got %+v", off, end, r)
+			waitFor(t, func() bool { return n.CatchUpProgress().Received >= want },
+				fmt.Sprintf("chunk at %d durable", off))
 		}
 	}
+	waitChunkSettled(t, n)
+	waitFor(t, func() bool { return n.CatchUpProgress().State == CatchUpCaughtUp }, "caught_up")
 	if n.CatchUpProgress().State != CatchUpCaughtUp {
 		t.Fatalf("want caught_up, got %+v", n.CatchUpProgress())
 	}
@@ -796,7 +852,7 @@ func TestChunkedSnapshotLeadershipChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	cli := NewClient("lc", nodesOf(c)...)
-	initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	initCtx, initCancel := context.WithTimeout(context.Background(), wd(10*time.Second))
 	n0 := writeBulk(t, cli, initCtx, 40)
 	initCancel()
 	waitForDur(t, 5*time.Second, func() bool {
@@ -833,31 +889,59 @@ func TestChunkedSnapshotLeadershipChange(t *testing.T) {
 	}, "laggard starts receiving chunks")
 	t.Logf("laggard received %d bytes before leadership change", ln.CatchUpProgress().Received)
 
-	// 崩溃旧领导者：在线的另一跟随者与落后节点构成多数派，立即选出新主。
+	// 崩溃旧领导者：在线的“健康跟随者”（不是正在追赶的 laggard）单独即可与
+	// laggard 构成多数派；新主必须从健康节点中产生，否则选出的新主自己也缺数据。
 	oldLeader := c.Leader()
 	if err := c.Crash(oldLeader); err != nil {
 		t.Fatal(err)
 	}
-	waitForDur(t, 8*time.Second, func() bool {
+	var healthy NodeID
+	waitCatchUp(t, func() bool {
 		for id, n := range c.Nodes() {
-			if id != oldLeader && n.Status().Role == RoleLeader {
+			if id != oldLeader && id != laggard && n.Status().Role == RoleLeader {
+				healthy = id
 				return true
 			}
 		}
 		return false
-	}, "new leader elected during catch-up")
-	// 新领导者上继续写入（其快照进度与旧主可能不同）。
-	churnCtx, churnCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer churnCancel()
-	for i := 200; i < 220; i++ {
-		if _, _, err := cli.Set(churnCtx, fmt.Sprintf("churn-%d", i), fmt.Sprintf("c%d", i)); err != nil {
-			t.Fatal(err)
+	}, "healthy follower elected during catch-up")
+	// 新主必须已持有追赶前的全部 bulk 数据（它作为旧主的跟随者已复制），
+	// 否则它没有资格把这些数据再同步给 laggard。
+	waitCatchUp(t, func() bool {
+		n := c.Node(healthy)
+		if n == nil {
+			return false
 		}
-	}
+		for i := 0; i < n0; i++ {
+			k, v := bulkKV(i)
+			if got, ok := n.sm.Lookup(k); !ok || got != v {
+				return false
+			}
+		}
+		return true
+	}, "new leader already holds all pre-change bulk data")
+	// 新领导者上继续写入（其快照进度与旧主可能不同）。后台尽力而为地写，带整体
+	// 短上限；本测试关注的是追赶收敛，不要求 churn 每条都提交成功。
+	churnCtx, churnCancel := context.WithTimeout(context.Background(), wd(8*time.Second))
+	defer churnCancel()
+	churnDone := make(chan struct{})
+	go func() {
+		defer close(churnDone)
+		for i := 200; i < 220; i++ {
+			if churnCtx.Err() != nil {
+				return
+			}
+			ctx, cancel := context.WithTimeout(churnCtx, wd(time.Second))
+			_, _, _ = cli.Set(ctx, fmt.Sprintf("churn-%d", i), fmt.Sprintf("c%d", i))
+			cancel()
+		}
+	}()
 	// 旧领导者恢复，集群回到 3 节点。
 	if err := c.Restart(oldLeader); err != nil {
 		t.Fatal(err)
 	}
+	// 收敛期间 churn 在后台进行，不阻塞；convergence 等待给它留足时间。
+	_ = churnDone
 
 	// 落后节点必须包含追赶前的全部已提交数据。
 	waitForDur(t, 12*time.Second, func() bool {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"time"
 )
 
 // internalEvent 是投递进节点事件循环的内部事件（RPC / 客户端请求 / 时钟）。
@@ -22,6 +23,7 @@ const (
 	eventTick eventKind = iota
 	eventRPC
 	eventTimeout
+	eventChunkWritten
 )
 
 // Node 是一个 Raft 节点。
@@ -46,6 +48,10 @@ type Node struct {
 	// 领导者可变状态
 	nextIndex  map[NodeID]Index
 	matchIndex map[NodeID]Index
+	// aeInflight：每个 peer 是否已有一个 AppendEntries RPC 在途。
+	// 慢接收端 + 高频提交时，每个响应都会触发再次广播；不加窗口会向同一个
+	// 卡住的对端无限堆积发送 goroutine（在同步模拟传输里表现为大量挂起调用）。
+	aeInflight map[NodeID]bool
 
 	// 领导者侧：每个 peer 的分块快照发送会话（仅事件循环访问）。
 	snapXfers map[NodeID]*snapshotTransfer
@@ -54,9 +60,23 @@ type Node struct {
 
 	// 跟随者侧：进行中的分块快照接收状态（仅事件循环访问；nil 表示没有）。
 	incoming *incomingSnapshot
+	// chunkEpoch 在开始一份全新临时快照时递增；用于丢弃身份已变更会话的迟到异步落盘结果。
+	chunkEpoch uint64
+	// logDirty：自上次后台落盘以来日志后缀有变更，等待下一个 tick 合并落盘一次。
+	logDirty bool
+	// compactBusy/pendingCompact：后台压缩（多次 fsync）单飞。慢盘上压缩可能慢于
+	// 压缩触发频率；进行中时只保留“最新一份待压缩”，避免队列被一连串快照任务压满
+	// 后反过来卡住事件循环。内存状态始终保持最新，磁盘快照稍后跟上即可。
+	compactBusy    bool
+	pendingCompact *chunkJob
 
 	// 候选人得票
 	grantedVotes map[NodeID]bool
+
+	// Pre-Vote 状态：preVoting=true 时处于预投票探测阶段（尚未递增任期）；
+	// preVotesGranted 记录已获得的预投票。追赶中的落后节点用 Pre-Vote 避免扰动领导者。
+	preVoting       bool
+	preVotesGranted map[NodeID]bool
 
 	// 等待提交的提案：日志索引 -> 全部等待者（重复请求会共用一个等待列表）
 	proposals map[Index][]chan clientOutcome
@@ -67,14 +87,37 @@ type Node struct {
 	pendingReads []*readState
 
 	electionElapsed int
-	rng             *rand.Rand
+	// ticksSinceSnapshot 距上次压缩过去的 tick 数（用于压缩节流）。
+	ticksSinceSnapshot int
+	rng                *rand.Rand
 
 	// ---- 事件循环通信 ----
 	events chan internalEvent
+	// chunkEvents 专收分块快照块。块是大流量的“数据面”消息，必须与心跳/投票等
+	// “控制面”消息分流：否则大量块会占满事件队列，把心跳饿死，导致接收节点在
+	// 追赶期间反复选举超时/领导权抖动。事件循环对两个队列做优先级选择。
+	chunkEvents chan internalEvent
+
+	// 接收侧分块快照后台落盘队列（每节点一个串行 worker，保证 reset/write/finalize/clear 严格有序）。
+	// 接收侧分块落盘队列。快照数据块走高优先通道（chunkJobs），保证慢盘上追赶
+	// 不被其它落盘拖死；正式快照/日志等落盘走低优先通道（persistJobs），由单独
+	// worker 处理。两条通道各自串行；两类资源（staging 文件 vs 正式快照/日志）
+	// 互不相交，因此无需跨通道排序。
+	chunkJobs   chan chunkJob
+	persistJobs chan chunkJob
+	// formalWriteMu 把“正式快照落盘 + 日志后缀重写”绑成不可分割的一段；发送方
+	// 读取快照（loadSnapshotForTransfer）取读锁，绝不读到两步之间的中间态。
+	formalWriteMu sync.RWMutex
+	// chunkIODelay：仅测试用，worker 每处理一个落盘任务前等待该时长（模拟慢盘）。
+	chunkIODelay time.Duration
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+	// handlerGen：Bind 到传输层的处理函数代次。崩溃后用同一传输重建节点会重新
+	// Bind 一个新处理函数；旧代次处理函数必须立即拒绝，否则发给“已死旧节点”的
+	// 在途 RPC 会永远挂起（其发送 goroutine 持有 wg，导致 Stop 无法结束）。
+	handlerGen uint64
 
 	// WG 用于等待节点发出的后台 goroutine（RPC 等）全部退出。
 	wg sync.WaitGroup
@@ -91,20 +134,24 @@ func NewNode(cfg Config, tr Transport) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{
-		cfg:        cfg,
-		store:      store,
-		tr:         tr,
-		sm:         NewKVStateMachine(),
-		role:       RoleFollower,
-		nextIndex:  make(map[NodeID]Index),
-		matchIndex: make(map[NodeID]Index),
-		snapXfers:  make(map[NodeID]*snapshotTransfer),
-		proposals:  make(map[Index][]chan clientOutcome),
-		appliedSeq: make(map[string]appliedSeqEntry),
-		events:     make(chan internalEvent, 256),
-		stopCh:     make(chan struct{}),
-		doneCh:     make(chan struct{}),
-		logf:       func(string, ...any) {},
+		cfg:         cfg,
+		store:       store,
+		tr:          tr,
+		sm:          NewKVStateMachine(),
+		role:        RoleFollower,
+		nextIndex:   make(map[NodeID]Index),
+		matchIndex:  make(map[NodeID]Index),
+		aeInflight:  make(map[NodeID]bool),
+		snapXfers:   make(map[NodeID]*snapshotTransfer),
+		proposals:   make(map[Index][]chan clientOutcome),
+		appliedSeq:  make(map[string]appliedSeqEntry),
+		events:      make(chan internalEvent, 256),
+		chunkEvents: make(chan internalEvent, 64),
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		chunkJobs:   make(chan chunkJob, 32),
+		persistJobs: make(chan chunkJob, 64),
+		logf:        func(string, ...any) {},
 	}
 	seed := cfg.RandSeed
 	if seed == 0 {
@@ -155,12 +202,22 @@ func (n *Node) restore() error {
 		return fmt.Errorf("load log: %w", err)
 	}
 	if len(entries) > 0 {
-		// 校验日志后缀与快照连续。
+		// 日志后缀必须紧跟快照点。崩溃可能恰好发生在“新快照已落盘、对应日志
+		// 后缀重写尚未完成”之间，留下一个起点超前的旧后缀文件；其条目已被新
+		// 快照覆盖，丢弃即可（并在启动时把当前后缀重写回磁盘）。
 		want := meta.LastIncludedIndex + 1
-		if entries[0].Index != want {
-			return fmt.Errorf("log suffix gap: want index %d, got %d", want, entries[0].Index)
+		switch {
+		case entries[0].Index == want:
+			n.log = append(n.log, entries...)
+		case entries[0].Index > want:
+			n.logDirty = true
+		default:
+			i := 0
+			for i < len(entries) && entries[i].Index <= meta.LastIncludedIndex {
+				i++
+			}
+			n.log = append(n.log, entries[i:]...)
 		}
-		n.log = append(n.log, entries...)
 	}
 
 	// 恢复上次未完成的分块快照接收状态（仅用于从断点续传，绝不直接安装）。
@@ -172,15 +229,34 @@ func (n *Node) restore() error {
 
 // Start 注册 RPC 处理器并启动事件循环与时钟。
 func (n *Node) Start() {
+	n.handlerGen++
+	h := n.makeRPCHandler()
 	n.tr.(interface {
 		Bind(NodeID, Handler)
-	}).Bind(n.cfg.ID, n.rpcHandler)
+	}).Bind(n.cfg.ID, h)
+	n.startChunkWorker()
+	n.startPersistWorker()
 	go n.run()
 }
 
-// Stop 优雅停止：关闭事件循环并等待后台 goroutine 退出。
+// flushCall 请事件循环同步执行 flushDurability（停止/崩溃前保证已提交数据落盘）。
+type flushCall struct{ done chan struct{} }
+
+// Stop 优雅停止：先在事件循环中刷盘（保证此前已提交数据 fsync），再关闭事件循环
+// 并等待后台 goroutine 退出。
 func (n *Node) Stop() error {
-	n.stopOnce.Do(func() { close(n.stopCh) })
+	n.stopOnce.Do(func() {
+		// 同步刷盘：即使控制面队列暂时被占满也要把 flush 投进去（阻塞投递），
+		// 否则可能在仍有已提交日志未落盘时退出。事件循环一定会处理 flushCall，
+		// 或在节点从未启动时 doneCh 已关闭，二者都保证这里能返回。
+		done := make(chan struct{})
+		select {
+		case n.events <- internalEvent{kind: eventRPC, rpc: flushCall{done: done}}:
+			<-done
+		case <-n.doneCh:
+		}
+		close(n.stopCh)
+	})
 	<-n.doneCh
 	n.wg.Wait()
 	return n.store.Close()

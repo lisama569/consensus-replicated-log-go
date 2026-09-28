@@ -93,11 +93,26 @@ func (n *Node) truncateTail(index Index) error {
 	return n.persistLog()
 }
 
-// persistLog 将占位项之外的日志后缀整体落盘。
+// persistLog 标记日志后缀为脏，由下一个 tick 合并落盘一次（见 flushDirtyLog）。
+// 高频写入时这样把“每条日志整文件重写+fsync”降为“每心跳最多一次”，
+// 避免 store worker 队列被写放大打爆后反过来卡住事件循环。
+//
+// 注意：压缩/安装快照需要立即把某个确定的日志形态落盘以保持崩溃安全顺序，
+// 那两条路径会先调用 flushDirtyLog 再投递自带日志副本的快照任务，不依赖本标记。
 func (n *Node) persistLog() error {
+	n.logDirty = true
+	return nil
+}
+
+// flushDirtyLog 在每个领导者 tick 把累积的日志变更合并为一次后台落盘。
+func (n *Node) flushDirtyLog() {
+	if !n.logDirty {
+		return
+	}
+	n.logDirty = false
 	suffix := []LogEntry{}
 	if len(n.log) > 1 {
-		suffix = n.log[1:]
+		suffix = append([]LogEntry(nil), n.log[1:]...)
 	}
-	return n.store.SaveLogSuffix(suffix)
+	n.enqueueLogPersist(suffix)
 }

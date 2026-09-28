@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const (
@@ -39,6 +40,11 @@ type persistedSnapshot struct {
 type FileStore struct {
 	dir string
 
+	// mu 串行化磁盘文件访问。持久化 worker 在事件循环之外执行 fsync，而事件循环
+	// 可能同时 LoadSnapshot（用于发送快照）或在恢复时读取，因此所有读写都加锁；
+	// 读操作用读锁以允许并发读，写操作互斥。内存模式同样加锁保持一致语义。
+	mu sync.RWMutex
+
 	// 内存模式（dir == ""）下使用的字段。
 	memTerm  Term
 	memVoted NodeID
@@ -70,6 +76,8 @@ func (s *FileStore) Close() error { return nil }
 // ---- 硬状态 ----
 
 func (s *FileStore) LoadState() (term Term, votedFor NodeID, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.dir == "" {
 		if !s.hasState {
 			return 0, "", nil
@@ -85,6 +93,8 @@ func (s *FileStore) LoadState() (term Term, votedFor NodeID, err error) {
 }
 
 func (s *FileStore) SaveState(term Term, votedFor NodeID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.dir == "" {
 		s.memTerm, s.memVoted, s.hasState = term, votedFor, true
 		return nil
@@ -95,6 +105,8 @@ func (s *FileStore) SaveState(term Term, votedFor NodeID) error {
 // ---- 快照 ----
 
 func (s *FileStore) SaveSnapshot(meta SnapshotMeta, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	p := persistedSnapshot{
 		LastIncludedIndex: meta.LastIncludedIndex,
 		LastIncludedTerm:  meta.LastIncludedTerm,
@@ -109,6 +121,8 @@ func (s *FileStore) SaveSnapshot(meta SnapshotMeta, data []byte) error {
 }
 
 func (s *FileStore) LoadSnapshot() (meta SnapshotMeta, data []byte, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var p persistedSnapshot
 	if s.dir == "" {
 		if !s.hasSnap {
@@ -132,6 +146,8 @@ func (s *FileStore) LoadSnapshot() (meta SnapshotMeta, data []byte, err error) {
 }
 
 func (s *FileStore) HasSnapshot() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.dir == "" {
 		return s.hasSnap
 	}
@@ -144,6 +160,8 @@ func (s *FileStore) HasSnapshot() bool {
 // SaveLogSuffix 用 entries 整体替换日志文件。
 // entries 必须是快照之后的全部日志（索引严格大于快照最后索引）。
 func (s *FileStore) SaveLogSuffix(entries []LogEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.dir == "" {
 		s.memLog = append([]LogEntry(nil), entries...)
 		return nil
@@ -153,7 +171,10 @@ func (s *FileStore) SaveLogSuffix(entries []LogEntry) error {
 
 // LoadLogEntries 返回快照之后的日志后缀；
 // 自动丢弃任何索引 <= 快照最后索引的残留条目（快照与日志压缩之间崩溃的情形）。
+// 本方法一次性持有读锁，内部直接读快照，避免锁重入。
 func (s *FileStore) LoadLogEntries() ([]LogEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var entries []LogEntry
 	if s.dir == "" {
 		entries = append(entries, s.memLog...)
@@ -167,12 +188,19 @@ func (s *FileStore) LoadLogEntries() ([]LogEntry, error) {
 		}
 	}
 	var cut Index
-	if s.HasSnapshot() {
-		meta, _, err := s.LoadSnapshot()
+	if s.dir == "" {
+		if s.hasSnap {
+			cut = s.memSnap.LastIncludedIndex
+		}
+	} else {
+		var p persistedSnapshot
+		ok, err := readJSON(filepath.Join(s.dir, snapshotFile), &p)
 		if err != nil {
 			return nil, err
 		}
-		cut = meta.LastIncludedIndex
+		if ok {
+			cut = p.LastIncludedIndex
+		}
 	}
 	out := entries[:0:0]
 	for _, e := range entries {

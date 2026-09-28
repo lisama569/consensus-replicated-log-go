@@ -40,6 +40,8 @@ type policyKey struct {
 type SnapshotFaultHook struct {
 	Drop   func(from, to NodeID, req *InstallSnapshotRequest) bool
 	Mutate func(from, to NodeID, req *InstallSnapshotRequest)
+	// Delay 返回该请求投递前额外等待的时长（<=0 不等待），模拟慢链路/超时。
+	Delay func(from, to NodeID, req *InstallSnapshotRequest) time.Duration
 }
 
 // MemoryTransport 是进程内模拟网络：同步调用 + 可注入故障。
@@ -236,6 +238,11 @@ func (t *MemoryTransport) SendInstallSnapshot(ctx context.Context, to NodeID, re
 			}
 			if h.Mutate != nil {
 				h.Mutate(req.LeaderID, to, req)
+			}
+			if h.Delay != nil {
+				if d := h.Delay(req.LeaderID, to, req); d > 0 {
+					time.Sleep(d)
+				}
 			}
 		}
 	}

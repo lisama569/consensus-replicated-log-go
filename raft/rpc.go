@@ -32,6 +32,8 @@ type RequestVoteRequest struct {
 	CandidateID  NodeID
 	LastLogIndex Index
 	LastLogTerm  Term
+	// PreVote=true 表示这是一次不递增任期的预投票探测。
+	PreVote bool
 }
 
 type RequestVoteResponse struct {
@@ -39,6 +41,7 @@ type RequestVoteResponse struct {
 	VoteGranted bool
 	Reason      RejectReason
 	Peer        NodeID
+	PreVote     bool
 }
 
 // ---- InstallSnapshot（快照追赶） ----

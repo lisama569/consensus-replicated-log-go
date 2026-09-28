@@ -51,6 +51,8 @@ func (s *FileStore) stagingDataPath() string {
 // ---- 临时快照：元数据 ----
 
 func (s *FileStore) SaveStagingMeta(m StagingMeta) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	p := persistedStaging{
 		Version:           stagingVersion,
 		TransferID:        m.TransferID,
@@ -69,6 +71,8 @@ func (s *FileStore) SaveStagingMeta(m StagingMeta) error {
 }
 
 func (s *FileStore) LoadStagingMeta() (StagingMeta, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	var p persistedStaging
 	if s.dir == "" {
 		if s.memStaging == nil {
@@ -84,14 +88,14 @@ func (s *FileStore) LoadStagingMeta() (StagingMeta, bool, error) {
 			return StagingMeta{}, false, nil
 		}
 	}
-	// 旧/损坏版本的临时数据：忽略并清理，绝不使用。
+	// 旧/损坏版本的临时数据：忽略并清理（已持读锁，不能再调用加写锁的 ClearStaging）。
 	if p.Version != stagingVersion || p.LastIncludedIndex == 0 || p.Length == 0 {
-		_ = s.ClearStaging()
+		_ = s.clearStagingLocked()
 		return StagingMeta{}, false, nil
 	}
 	sum, err := base64.StdEncoding.DecodeString(p.Checksum)
 	if err != nil || len(sum) == 0 {
-		_ = s.ClearStaging()
+		_ = s.clearStagingLocked()
 		return StagingMeta{}, false, nil
 	}
 	return StagingMeta{
@@ -105,6 +109,13 @@ func (s *FileStore) LoadStagingMeta() (StagingMeta, bool, error) {
 }
 
 func (s *FileStore) ClearStaging() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clearStagingLocked()
+}
+
+// clearStagingLocked 执行清理但不加锁（调用方必须已持有 s.mu）。
+func (s *FileStore) clearStagingLocked() error {
 	if s.dir == "" {
 		s.memStaging = nil
 		s.memStagingData = nil
@@ -118,6 +129,8 @@ func (s *FileStore) ClearStaging() error {
 
 // StartStagingData 截断并重建数据文件（开始一份全新的临时快照）。
 func (s *FileStore) StartStagingData() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.dir == "" {
 		s.memStagingData = []byte{}
 		return nil
@@ -128,6 +141,8 @@ func (s *FileStore) StartStagingData() error {
 // AppendStagingChunk 在 offset 处写入一块数据；offset 必须严格等于当前文件长度。
 // 写入采用 O_APPEND + fsync，返回前该块已 durable，崩溃重启后仍可从断点续传。
 func (s *FileStore) AppendStagingChunk(offset uint64, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.dir == "" {
 		if uint64(len(s.memStagingData)) != offset {
 			return errors.New("raft: staging chunk offset mismatch")
@@ -161,6 +176,8 @@ func (s *FileStore) AppendStagingChunk(offset uint64, data []byte) error {
 
 // StagingSize 返回临时数据文件当前长度。
 func (s *FileStore) StagingSize() (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.dir == "" {
 		return uint64(len(s.memStagingData)), nil
 	}
@@ -176,6 +193,8 @@ func (s *FileStore) StagingSize() (uint64, error) {
 
 // LoadStagingData 读取临时快照全部已收字节（收齐后做整体校验与安装）。
 func (s *FileStore) LoadStagingData() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.dir == "" {
 		return append([]byte(nil), s.memStagingData...), nil
 	}

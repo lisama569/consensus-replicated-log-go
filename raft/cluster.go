@@ -85,6 +85,13 @@ func (c *Cluster) SetSnapshotThreshold(id NodeID, n uint64) {
 	c.cfgs[id] = cfg
 }
 
+// SetSnapshotMinGapTicks 设置压缩最小间隔 tick 数（对尚未创建的节点生效，需重启加载）。
+func (c *Cluster) SetSnapshotMinGapTicks(id NodeID, ticks int) {
+	cfg := c.cfgs[id]
+	cfg.SnapshotMinGapTicks = ticks
+	c.cfgs[id] = cfg
+}
+
 // SetSnapshotChunkSize 配置分块快照的块大小（对尚未创建的节点生效，需重启节点加载）。
 func (c *Cluster) SetSnapshotChunkSize(id NodeID, bytes int) {
 	cfg := c.cfgs[id]

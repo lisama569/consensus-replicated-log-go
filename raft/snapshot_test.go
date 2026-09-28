@@ -92,15 +92,17 @@ func TestSnapshotCompactionAndRestart(t *testing.T) {
 		}
 	}
 	waitFor(t, func() bool { return c.Leader() != "" }, "leader after snapshot restart")
-	// 给集群一点时间追平崩溃瞬间未同步的尾部日志。
-	waitFor(t, func() bool {
+	// 重启后各节点的提交位置可能短暂低于崩溃前记录值：它会作为跟随者从（可能
+	// 压缩点更靠后的）新领导者重新复制尾部日志。等待每个节点恢复到自己崩溃前
+	// 的提交位置——“已提交数据不丢、最终不回退”，而不是要求重启瞬间立即相等。
+	waitForDur(t, 8*time.Second, func() bool {
 		for _, n := range c.Nodes() {
 			if n.Status().CommitIndex < commits[n.cfg.ID] {
-				return false // 已持久化的提交位置不得回退
+				return false
 			}
 		}
 		return true
-	}, "no node regresses below its persisted commit")
+	}, "every node recovers its pre-crash commit after restart")
 
 	for _, n := range c.Nodes() {
 		s := n.Status()
@@ -215,6 +217,9 @@ func TestConcurrentReadWriteSnapshot(t *testing.T) {
 	defer c.Stop()
 	for _, id := range c.IDs() {
 		c.SetSnapshotThreshold(id, 3)
+		// 该测试持续高频写且状态机不断变大：给压缩加最小间隔，避免每个 tick 都
+		// 序列化整份状态机把事件循环占满（真实部署的默认值也建议这样节流）。
+		c.SetSnapshotMinGapTicks(id, 20)
 	}
 	for _, n := range c.Nodes() {
 		n.SetSnapshotThreshold(3)
@@ -274,15 +279,28 @@ func TestConcurrentReadWriteSnapshot(t *testing.T) {
 	cancel()
 	wg.Wait()
 
-	// 所有节点的状态机最终一致。-race + 整包高负载下给足收敛时间。
-	leader := c.Node(c.Leader())
-	v, _ := leader.sm.Lookup("w0")
-	waitForDur(t, 8*time.Second, func() bool {
+	// 所有节点的状态机最终一致：以领导者已提交位置为准，等待各节点应用追平，
+	// 再比对一个收敛后不再变化的键（读两次确认稳定）。-race + 高负载下给足时间。
+	waitForDur(t, wd(20*time.Second), func() bool {
+		ld := c.Node(c.Leader())
+		if ld == nil {
+			return false
+		}
+		lc := ld.Status().CommitIndex
 		for _, n := range c.Nodes() {
-			if got, _ := n.sm.Lookup("w0"); got != v {
+			s := n.Status()
+			if s.CommitIndex < lc || s.AppliedIndex < lc {
 				return false
 			}
 		}
 		return true
-	}, "all nodes converge after concurrent workload")
+	}, "all nodes apply up to leader commit after workload")
+
+	// 应用追平后，各节点对同一已提交键必须读到相同值。
+	v, _ := c.Node(c.Leader()).sm.Lookup("w0")
+	for _, n := range c.Nodes() {
+		if got, _ := n.sm.Lookup("w0"); got != v {
+			t.Fatalf("node %s w0=%q want %q after convergence", n.cfg.ID, got, v)
+		}
+	}
 }

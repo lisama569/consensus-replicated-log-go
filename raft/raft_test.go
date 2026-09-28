@@ -13,9 +13,17 @@ const (
 	waitShort = 2 * time.Second
 )
 
+// wd 按是否启用 -race 放大超时（race 下整体慢约一个数量级）。
+func wd(d time.Duration) time.Duration {
+	if raceEnabled {
+		return d * 6
+	}
+	return d
+}
+
 func waitFor(t *testing.T, cond func() bool, msg string) {
 	t.Helper()
-	deadline := time.Now().Add(waitShort)
+	deadline := time.Now().Add(wd(waitShort))
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

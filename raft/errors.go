@@ -20,15 +20,19 @@ const (
 
 // 可用于 errors.Is 的哨兵错误。
 var (
-	ErrNotLeader      = errors.New("raft: node is not the leader")
-	ErrStaleTerm      = errors.New("raft: request has stale term")
-	ErrAlreadyVoted   = errors.New("raft: already voted in this term")
-	ErrLogNotUpToDate = errors.New("raft: candidate log is not up-to-date")
-	ErrLeaderDeposed  = errors.New("raft: leader deposed by higher term before commit")
-	ErrSteppedDown    = errors.New("raft: node stepped down")
-	ErrStopped        = errors.New("raft: node stopped")
-	ErrCompacted      = errors.New("raft: requested index is older than snapshot")
+	ErrNotLeader        = errors.New("raft: node is not the leader")
+	ErrStaleTerm        = errors.New("raft: request has stale term")
+	ErrAlreadyVoted     = errors.New("raft: already voted in this term")
+	ErrLogNotUpToDate   = errors.New("raft: candidate log is not up-to-date")
+	ErrLeaderDeposed    = errors.New("raft: leader deposed by higher term before commit")
+	ErrSteppedDown      = errors.New("raft: node stepped down")
+	ErrStopped          = errors.New("raft: node stopped")
+	ErrCompacted        = errors.New("raft: requested index is older than snapshot")
+	ErrSnapshotChecksum = errors.New("raft: staged snapshot checksum mismatch")
 )
+
+// errSnapshotChecksum 是内部哨兵：临时快照整体校验失败（长度不符或 SHA-256 不一致）。
+var errSnapshotChecksum = ErrSnapshotChecksum
 
 // LeaderHintError 在 ErrNotLeader 之上附带当前已知的领导者 ID，便于客户端重试。
 type LeaderHintError struct {

@@ -17,47 +17,73 @@ func (n *Node) maybeSnapshot() {
 	if n.commitIndex <= n.snapMeta.LastIncludedIndex {
 		return
 	}
+	// 压缩节流：生成快照与状态机大小同阶（导出+序列化），高频触发会让其 CPU/IO
+	// 成本超过正常复制。即使阈值很小，也保证两次压缩之间至少间隔 GapTicks。
+	if n.ticksSinceSnapshot < n.cfg.SnapshotMinGapTicks {
+		return
+	}
 	n.takeSnapshot(n.commitIndex)
 }
 
-// takeSnapshot 在 index 处执行一次压缩：
-//  1. 状态机导出字节（与 Apply/Lookup 通过 RWMutex 同步）；
-//  2. 原子落盘新快照（tmp+fsync+rename）；
-//  3. 用新的后缀重写日志文件并替换内存日志。
+// takeSnapshot 在 index 处安排一次压缩。
 //
-// 顺序保证：快照先持久化、日志后截断。任何崩溃时刻下，
-// “快照内的状态”都不会多于已提交状态，重启恢复不会丢失或回退已提交内容。
+// 快照字节在事件循环内、与 Apply 互斥地导出，保证字节内容恰好覆盖到快照点 index；
+// 真正的多次 fsync（原子落盘快照 + 重写日志后缀）放到后台持久化 worker，不阻塞
+// 协议心跳与快照块收发。压缩由 SnapshotMinGapTicks 节流（默认不节流）。
 func (n *Node) takeSnapshot(index Index) {
 	meta, ok := n.snapshotMetaAt(index)
 	if !ok {
 		return
 	}
+	// 与 Apply 串行（事件循环内），字节内容严格对应 index，不会把快照点之后的
+	// 状态与“index 之后的日志后缀”错误地重复重放。
 	data, err := n.sm.Snapshot()
 	if err != nil {
 		n.logf("[%s] state machine snapshot error: %v", n.cfg.ID, err)
 		return
 	}
-	if err := n.store.SaveSnapshot(meta, data); err != nil {
-		n.logf("[%s] persist snapshot error: %v", n.cfg.ID, err)
-		return
-	}
+	n.ticksSinceSnapshot = 0
 
 	oldLast := n.snapMeta.LastIncludedIndex
-	// 必须在切换 snapMeta 之前、按旧快照点计算物理下标：
-	// index 处的条目将成为新占位项（新日志下标 0），其后为保留后缀。
 	pi := n.physicalIndex(index)
 	placeholder := n.log[pi]
 	var suffix []LogEntry
 	if pi+1 < len(n.log) {
 		suffix = append([]LogEntry(nil), n.log[pi+1:]...)
 	}
+	logCopy := append([]LogEntry{placeholder}, suffix...)
+
 	n.snapMeta = meta
-	n.log = append([]LogEntry{placeholder}, suffix...)
-	if err := n.persistLog(); err != nil {
-		n.logf("[%s] rewrite log after compaction error: %v", n.cfg.ID, err)
+	n.log = logCopy
+	n.logDirty = false
+	n.debugf("compacted: snapshot index %d->%d (fsync in background)",
+		oldLast, meta.LastIncludedIndex)
+
+	// 后台仅负责 fsync（快照字节已在事件循环内确定）。单飞：同时只有一份压缩
+	// 在落盘，期间产生的更新压缩只保留最新一份。
+	job := chunkJob{kind: jobPersistCompact, meta: meta,
+		data: append([]byte(nil), data...), log: logCopy}
+	if n.compactBusy {
+		n.pendingCompact = &job
+	} else {
+		n.compactBusy = true
+		if !n.enqueuePersistAck(job) {
+			// 队列暂满（磁盘跟不上）：内存已压缩，下个 tick/再次压缩会重做落盘；
+			// flushDurability 停止前也会再写，保证不丢。
+		}
 	}
-	n.debugf("compacted: snapshot index %d->%d, retained suffix entries=%d",
-		oldLast, meta.LastIncludedIndex, len(n.log)-1)
+}
+
+// onCompactPersisted 由 store worker 的压缩完成事件调用：若期间又有更新的压缩，
+// 立即投递最新一份；否则解除单飞。
+func (n *Node) onCompactPersisted() {
+	if n.pendingCompact != nil {
+		job := n.pendingCompact
+		n.pendingCompact = nil
+		n.enqueuePersistAck(*job)
+		return
+	}
+	n.compactBusy = false
 }
 
 func (n *Node) snapshotMetaAt(index Index) (SnapshotMeta, bool) {
@@ -72,7 +98,11 @@ func (n *Node) snapshotMetaAt(index Index) (SnapshotMeta, bool) {
 }
 
 // loadSnapshotForTransfer 读取本地快照字节并计算校验和，供分块发送使用。
+// 取 formalWriteMu 读锁：避免读到“快照文件已更新、日志后缀尚未重写”的中间态
+// （那两步在 persist worker 里持写锁原子完成）。
 func (n *Node) loadSnapshotForTransfer() ([]byte, SnapshotMeta, []byte, bool) {
+	n.formalWriteMu.RLock()
+	defer n.formalWriteMu.RUnlock()
 	meta, data, err := n.store.LoadSnapshot()
 	if err != nil || meta.LastIncludedIndex == 0 {
 		return nil, SnapshotMeta{}, nil, false
@@ -85,14 +115,6 @@ func (n *Node) loadSnapshotForTransfer() ([]byte, SnapshotMeta, []byte, bool) {
 // 读取本地快照失败时回退为空操作（下一轮心跳会再次尝试）。
 func (n *Node) sendSnapshot(peer NodeID) {
 	n.startSnapshotTransfer(peer)
-}
-
-// snapshotIdentity 标识一份快照的内容身份。
-type snapshotIdentity struct {
-	lastIncluded Index
-	term         Term
-	length       uint64
-	checksum     string
 }
 
 // sendSnapshotChunk 在独立 goroutine 中发送一个分块快照请求，响应投递回事件循环。
@@ -108,7 +130,7 @@ func (n *Node) sendSnapshotChunk(peer NodeID, req *InstallSnapshotRequest) {
 		rpcResp := n.tr.SendInstallSnapshot(context.Background(), peer, &out)
 		if rpcResp == nil {
 			select {
-			case n.events <- internalEvent{kind: eventRPC, rpc: chunkTimeout{peer: peer}}:
+			case n.events <- internalEvent{kind: eventRPC, rpc: chunkTimeout{peer: peer, offset: req.Offset}}:
 			case <-n.stopCh:
 			}
 			return
@@ -131,8 +153,11 @@ func (n *Node) sendSnapshotChunk(peer NodeID, req *InstallSnapshotRequest) {
 	}()
 }
 
-// chunkTimeout 表示某个分块的请求或响应丢失（网络返回 nil）。
-type chunkTimeout struct{ peer NodeID }
+// chunkTimeout 表示某个分块的请求或响应丢失，offset 为该块起始偏移。
+type chunkTimeout struct {
+	peer   NodeID
+	offset uint64
+}
 
 // handleInstallSnapshot 在事件循环内处理旧版（一次性整体）快照安装（论文 §5.7）。
 // 保留该路径用于与旧版本节点的互操作；大快照默认走分块续传路径。
@@ -172,21 +197,12 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 	return resp
 }
 
-// commitSnapshotInstall 把一份完整快照提升为节点当前状态：
-//  1. 先原子落盘正式快照（崩溃恢复不丢）；
-//  2. 重置日志为「占位项 + 快照点之后仍连续匹配的后缀」并重写日志文件；
-//  3. 恢复状态机；
-//  4. 提交/应用位置至少追到快照点，再继续应用保留后缀中的已提交条目。
-//
-// 压缩与安装共用该函数，保证两种路径的崩溃安全语义完全一致。
+// commitSnapshotInstall 把一份完整快照提升为节点当前状态（接收方路径）。
+// 磁盘部分（原子落盘快照 + 重写日志后缀）由后台 store worker 串行执行，
+// 保证不与常规日志/压缩落盘乱序；完成后在调用上下文中完成内存与状态机切换。
+// 分块路径在收到 worker 完成事件后调用 applyInstalledSnapshot；旧版一次性路径
+// 通过 installSnapshotAndWait 同步等待 worker 完成后再返回 RPC。
 func (n *Node) commitSnapshotInstall(meta SnapshotMeta, data []byte) error {
-	// 1. 先落盘快照。
-	if err := n.store.SaveSnapshot(meta, data); err != nil {
-		return err
-	}
-
-	// 2. 重置内存日志：占位项 + 快照点之后仍连续匹配的后缀（论文规则）。
-	//    必须先用旧 snapMeta 计算要保留的后缀，再切换 snapMeta。
 	kept := []LogEntry{{Index: meta.LastIncludedIndex, Term: meta.LastIncludedTerm}}
 	if n.lastLogIndex() >= meta.LastIncludedIndex+1 {
 		if e, ok := n.entryAt(meta.LastIncludedIndex + 1); ok {
@@ -196,25 +212,75 @@ func (n *Node) commitSnapshotInstall(meta SnapshotMeta, data []byte) error {
 			}
 		}
 	}
-	n.snapMeta = meta
-	n.log = kept
-	if err := n.persistLog(); err != nil {
-		n.logf("[%s] rewrite log after install snapshot error: %v", n.cfg.ID, err)
+	if err := n.installSnapshotSync(meta, data, kept); err != nil {
+		return err
+	}
+	return n.applyInstalledSnapshot(meta, data)
+}
+
+// installSnapshotSync 把快照+日志后缀任务交给 store worker 并等待其 fsync 完成。
+func (n *Node) installSnapshotSync(meta SnapshotMeta, data []byte, kept []LogEntry) error {
+	done := make(chan error, 1)
+	job := chunkJob{
+		kind: jobPersistInstall, meta: meta,
+		data: append([]byte(nil), data...), log: kept,
+		ack: true, syncDone: done,
+	}
+	select {
+	case n.chunkJobs <- job:
+	case <-n.stopCh:
+		return ErrStopped
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-n.stopCh:
+		return ErrStopped
+	}
+}
+
+// applyInstalledSnapshot 在事件循环内完成快照安装的内存部分（worker 落盘成功后）。
+//
+// 单调安全：绝不因安装快照而让状态机内容回退。分两种情况：
+//  1. 快照覆盖到的位置已不超过本地“已应用”位置：本地状态机已是它的超集，
+//     只更新快照点/日志边界，不 Restore（避免把已应用的键清掉）。
+//  2. 快照严格领先本地已应用位置：正常 Restore，再重放快照点之后保留的后缀。
+func (n *Node) applyInstalledSnapshot(meta SnapshotMeta, data []byte) error {
+	kept := []LogEntry{{Index: meta.LastIncludedIndex, Term: meta.LastIncludedTerm}}
+	if n.lastLogIndex() >= meta.LastIncludedIndex+1 {
+		if e, ok := n.entryAt(meta.LastIncludedIndex + 1); ok {
+			pi := n.physicalIndex(e.Index)
+			if pi >= 1 && pi < len(n.log) {
+				kept = append(kept, n.log[pi:]...)
+			}
+		}
 	}
 
-	// 3. 恢复状态机到快照内容。
+	if meta.LastIncludedIndex <= n.lastApplied {
+		// 本地已应用到更靠前的位置：当前状态机已经是快照内容的超集。只把快照/
+		// 日志边界前移（取更靠后的），绝不 Restore 旧数据。
+		n.debugf("snapshot at %d <= applied %d: keep state, advance bounds",
+			meta.LastIncludedIndex, n.lastApplied)
+		if meta.LastIncludedIndex > n.snapMeta.LastIncludedIndex {
+			n.snapMeta = meta
+			n.log = kept
+		}
+		if meta.LastIncludedIndex > n.commitIndex {
+			n.commitIndex = meta.LastIncludedIndex
+		}
+		return nil
+	}
+
+	// 快照领先已应用位置：安全恢复到快照点并重放后缀。
+	n.snapMeta = meta
+	n.log = kept
 	if err := n.sm.Restore(data); err != nil {
 		return err
 	}
-
-	// 4. 提交位置/应用位置至少追到快照点。
 	if meta.LastIncludedIndex > n.commitIndex {
 		n.commitIndex = meta.LastIncludedIndex
 	}
-	if meta.LastIncludedIndex > n.lastApplied {
-		n.lastApplied = meta.LastIncludedIndex
-	}
-	// 若保留了快照点之后的已提交条目，继续应用。
+	n.lastApplied = meta.LastIncludedIndex
 	n.applyCommitted()
 	return nil
 }

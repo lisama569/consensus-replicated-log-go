@@ -27,6 +27,11 @@ type Config struct {
 	SnapshotChunkSize int
 	// SnapshotRetryTicks 分块快照在未收到确认后重发当前块的 tick 间隔；0 使用默认值。
 	SnapshotRetryTicks int
+	// SnapshotMinGapTicks 两次压缩之间至少间隔的 tick 数（0 使用默认值）。
+	// 生成快照（导出/序列化整个状态机）与状态机大小同阶，阈值很小时压缩会被
+	// 高频触发、其 CPU/IO 成本超过写入本身；该下限把压缩成本均摊开，
+	// 同时仍满足“增量日志达阈值后尽快压缩”的常规需求。
+	SnapshotMinGapTicks int
 
 	// RandSeed 随机种子：测试固定种子保证可复现；传 0 时使用时间随机。
 	RandSeed int64
@@ -40,7 +45,10 @@ func DefaultConfig() Config {
 		ElectionMax:        20, // 200ms
 		SnapshotThreshold:  50,
 		SnapshotChunkSize:  64 * 1024,
-		SnapshotRetryTicks: 5, // 50ms
+		SnapshotRetryTicks: 2, // 20ms：丢失块快速重传，停等传输不会因单次丢包停顿太久
+		// 默认不做压缩时间节流（0）：只按增量阈值压缩。跟随者在突发复制时必须尽快
+		// 压出快照，否则它被选为新主后无法向更落后的节点提供足够新的快照。
+		SnapshotMinGapTicks: 0,
 	}
 }
 
@@ -78,7 +86,11 @@ func (c *Config) validate() error {
 		c.SnapshotChunkSize = 64 * 1024
 	}
 	if c.SnapshotRetryTicks <= 0 {
-		c.SnapshotRetryTicks = 5
+		c.SnapshotRetryTicks = 2
+	}
+	// 0 表示不做时间节流（仅按增量阈值压缩）；>0 时两次压缩至少间隔该 tick 数。
+	if c.SnapshotMinGapTicks < 0 {
+		c.SnapshotMinGapTicks = 0
 	}
 	return nil
 }

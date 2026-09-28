@@ -82,21 +82,47 @@ func (n *Node) broadcastAppendEntries() {
 		if p == n.cfg.ID {
 			continue
 		}
-		n.sendAppendEntries(p)
+		n.sendAppendEntriesForce(p, false)
 	}
 }
 
-func (n *Node) sendAppendEntries(peer NodeID) {
+// broadcastHeartbeat 每个 tick 调用：强制重发心跳，使 AE 在途窗口在丢包/领导权
+// 切换后能自愈（不被残留的在途标记永久卡住某个 peer）。
+func (n *Node) broadcastHeartbeat() {
+	if n.role != RoleLeader {
+		return
+	}
+	for _, p := range n.cfg.Peers {
+		if p == n.cfg.ID {
+			continue
+		}
+		n.sendAppendEntriesForce(p, true)
+	}
+}
+
+func (n *Node) sendAppendEntries(peer NodeID) { n.sendAppendEntriesForce(peer, false) }
+
+// sendAppendEntriesForce 发送一条 AppendEntries（或在落后时走快照）。
+// force=true（每 tick 的心跳）忽略在途窗口，保证心跳不会因丢失的在途标记停发。
+func (n *Node) sendAppendEntriesForce(peer NodeID, force bool) {
 	if n.role != RoleLeader {
 		return
 	}
 	ni := n.nextIndex[peer]
 
 	// peer 落后到快照覆盖范围之前：改用分块 InstallSnapshot 追赶。
-	// 判定必须以 matchIndex 为准：nextIndex=snapLast+1 时 AE 的 prevIndex
-	// 正好是 snapLast，而没有该快照的跟随者仍然匹配不上，会陷入拒绝风暴。
 	if n.matchIndex[peer] < n.snapMeta.LastIncludedIndex {
+		if tr := n.snapXfers[peer]; tr != nil && tr.backoff == 0 && !tr.done {
+			return
+		}
 		n.sendSnapshot(peer)
+		return
+	}
+
+	// 停等窗口：上一条 AppendEntries 还在途时不重复发送。新提交会在该响应
+	// 回来后立即补推（handleAppendResponse 末尾再 sendAppendEntries），
+	// 心跳也会每个 tick 重发，因此不损失新鲜度，只去掉重复洪泛。
+	if !force && n.aeInflight[peer] {
 		return
 	}
 
@@ -111,11 +137,17 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 		Entries:      entries,
 		LeaderCommit: n.commitIndex,
 	}
+	n.aeInflight[peer] = true
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()
 		resp := n.tr.SendAppendEntries(context.Background(), peer, req)
 		if resp == nil {
+			// 丢包/对端不可达：没有响应事件，这里直接释放窗口，下个 tick 重发。
+			select {
+			case n.events <- internalEvent{kind: eventRPC, rpc: aeTimeout{peer: peer}}:
+			case <-n.stopCh:
+			}
 			return
 		}
 		select {
@@ -124,6 +156,9 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 		}
 	}()
 }
+
+// aeTimeout 表示某 peer 的 AppendEntries 请求/响应丢失，仅用于释放停等窗口。
+type aeTimeout struct{ peer NodeID }
 
 // ---- 跟随者：接收 ----
 
@@ -146,9 +181,12 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 	n.leaderID = req.LeaderID
 	n.resetElectionTimer()
 
-	// 一致性检查：prevLogIndex 落在快照覆盖范围内但 term 对不上，
-	// 说明领导者视图与本快照冲突（正常不会发生；要求快照同步）。
+	// 一致性检查：prevLogIndex 落在本节点快照覆盖范围内（<= 快照点）。
+	// 领导者携带的可能是一份更新的快照/日志——这种“本地缺日志”不是冲突，
+	// 必须明确要求快照同步（log_not_up_to_date 且 XIndex=本地快照点）；
+	// 领导者据此走 InstallSnapshot，而不是反复用同一 prevIndex 撞拒绝。
 	if req.PrevLogIndex < n.snapMeta.LastIncludedIndex {
+		resp.Success = false
 		resp.Reason = RejectLogNotUpToDate
 		resp.XIndex = n.snapMeta.LastIncludedIndex
 		return resp
@@ -185,9 +223,15 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 		}
 	}
 
-	// 追加新条目：遇到 term 冲突则截断之后再追加。
+	// 追加新条目：跳过快照点之前的；本地缺失则必须与本地末尾连续后追加，任期冲突
+	// 则截断后覆盖；索引/任期都相同则幂等跳过。遍历“全部”携带条目。
+	// 任何一条出现“本地缺失但又不接在末尾之后”的空洞都视为致命冲突——prevLog 检查
+	// 已保证请求前缀与本地匹配，正常的 AE 条目必然在 prevLogIndex 之后连续；出现
+	// 空洞只能说明本节点日志与领导者分叉，必须整体拒绝并回报真实起点，由领导者经
+	// 快速回退/快照补齐，绝不静默跳过（否则会丢掉空洞之后的条目）。
 	if len(req.Entries) > 0 {
-		appended := false
+		changed := false
+		conflict := false
 		for _, e := range req.Entries {
 			if e.Index <= n.snapMeta.LastIncludedIndex {
 				continue
@@ -195,27 +239,37 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 			existing, exists := n.entryAt(e.Index)
 			switch {
 			case !exists:
-				// 从 e 开始（含）连续追加后续全部条目。
-				rest := collectFrom(req.Entries, e.Index)
-				if err := n.appendSuffix(rest); err != nil {
-					n.logf("[%s] append suffix error: %v", n.cfg.ID, err)
+				if e.Index != n.lastLogIndex()+1 {
+					resp.Success = false
+					resp.PeerLastIndex = n.lastLogIndex()
+					resp.XTerm = 0
+					resp.XIndex = n.snapMeta.LastIncludedIndex + 1
+					n.debugf("append gap at entry %d (local last=%d snap=%d) -> reject",
+						e.Index, n.lastLogIndex(), n.snapMeta.LastIncludedIndex)
+					conflict = true
+					break
 				}
-				appended = true
+				n.log = append(n.log, e)
+				changed = true
 			case existing.Term != e.Term:
 				if err := n.truncateTail(e.Index); err != nil {
 					n.logf("[%s] truncate error: %v", n.cfg.ID, err)
+					continue
 				}
-				rest := collectFrom(req.Entries, e.Index)
-				if err := n.appendSuffix(rest); err != nil {
-					n.logf("[%s] append suffix error: %v", n.cfg.ID, err)
-				}
-				appended = true
+				n.log = append(n.log, e)
+				changed = true
 			}
-			if appended {
+			if conflict {
 				break
 			}
 		}
-		if appended {
+		if conflict {
+			return resp
+		}
+		if changed {
+			if err := n.persistLog(); err != nil {
+				n.logf("[%s] append suffix persist error: %v", n.cfg.ID, err)
+			}
 			n.debugf("appended entries up to lastIndex=%d from leader t=%d",
 				n.lastLogIndex(), req.Term)
 		}
@@ -243,6 +297,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 // ---- 领导者：处理跟随者响应 ----
 
 func (n *Node) handleAppendResponse(peer NodeID, resp *AppendEntriesResponse) {
+	n.aeInflight[peer] = false
 	if resp.Term > n.term {
 		n.debugf("append response from %s carries higher term %d -> step down", peer, resp.Term)
 		n.becomeFollower(resp.Term)
@@ -283,26 +338,22 @@ func (n *Node) handleAppendResponse(peer NodeID, resp *AppendEntriesResponse) {
 
 // backoffPeer 根据冲突提示回退 nextIndex（论文 §5.3 优化）。
 func (n *Node) backoffPeer(peer NodeID, resp *AppendEntriesResponse) {
-	n.debugf("peer %s rejected append reason=%s xTerm=%d xIndex=%d (old next=%d)",
-		peer, resp.Reason, resp.XTerm, resp.XIndex, n.nextIndex[peer])
-	switch {
-	case resp.XTerm != 0:
+	// 跟随者的冲突点 XIndex 若不小于本节点快照点，说明它可能仍保留所需日志，
+	// 直接采用；否则它已落后到本节点快照覆盖范围（或持有更新的快照点），
+	// nextIndex 必须夹到“本节点快照点之后”，下一条消息改走 InstallSnapshot。
+	if resp.XTerm != 0 {
 		if last := n.lastIndexOfTerm(resp.XTerm); last > 0 {
-			// 本节点日志仍保留该任期：跳过整个冲突任期。
 			n.nextIndex[peer] = last + 1
 		} else {
-			// 本节点已没有该任期：直接采用跟随者给出的该任期起点。
 			n.nextIndex[peer] = resp.XIndex
 		}
-	case resp.XIndex > 0:
+	} else if resp.XIndex > n.snapMeta.LastIncludedIndex {
+		// XIndex 是跟随者能接受的第一条索引（其快照点之后）。下一条 AE 的
+		// prevLogIndex = nextIndex-1 必须等于跟随者快照点，因此 nextIndex
+		// 直接设为 XIndex（即“要发送的第一条”），不能设成 XIndex 本身再
+		// 当作 prev——那会让 prevLogIndex 落到跟随者已压缩的空洞里被无限拒绝。
 		n.nextIndex[peer] = resp.XIndex
-	default:
-		n.nextIndex[peer] = 1
-	}
-	// 快照边界强制夹取：nextIndex 必须严格大于本节点快照点。
-	// 跟随者可能只持有未压缩的旧前缀，给出的 XIndex 落在快照点或更早；
-	// 这种 nextIndex 一律意味着“落后到快照覆盖范围”，必须走 InstallSnapshot。
-	if n.nextIndex[peer] <= n.snapMeta.LastIncludedIndex {
+	} else {
 		n.nextIndex[peer] = n.snapMeta.LastIncludedIndex + 1
 	}
 	n.sendAppendEntries(peer)
@@ -413,14 +464,4 @@ func (n *Node) lastIndexOfTerm(t Term) Index {
 		}
 	}
 	return last
-}
-
-// collectFrom 从 entries 中挑出 Index >= from 的连续后缀。
-func collectFrom(entries []LogEntry, from Index) []LogEntry {
-	for i, e := range entries {
-		if e.Index == from {
-			return append([]LogEntry(nil), entries[i:]...)
-		}
-	}
-	return nil
 }
